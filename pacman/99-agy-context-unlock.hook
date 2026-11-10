@@ -1,0 +1,22 @@
+# Pacman PostTransaction hook for agy-context-unlock (Arch Linux / EndeavourOS / CachyOS).
+#
+# IMPORTANT: replace /path/to/agy-context-unlock below with the ABSOLUTE path
+# where you cloned this repository (for example /home/<you>/.local/share/agy-context-unlock).
+# A leading "~" is NOT expanded here: libalpm parses this file itself and executes
+# the command directly via execv(3), without a shell. "~" would be passed literally
+# and the hook would silently fail after every package upgrade.
+#
+# You can also generate a correct hook automatically instead of editing this file:
+#   python3 agy_context_unlock.py pacman-hook --script-path <absolute-path> \
+#     --write /etc/pacman.d/hooks/99-agy-context-unlock.hook
+
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = antigravity-cli
+
+[Action]
+Description = Patching /usr/bin/agy to unlock context window limit (settings.json & override)...
+When = PostTransaction
+Exec = /usr/bin/python3 /path/to/agy-context-unlock/agy_context_unlock.py patch --binary /usr/bin/agy --in-place --yes --allow-system --allow-unknown
