@@ -189,12 +189,12 @@ python3 -m unittest discover -s tests -v
 
 - **[google-antigravity/antigravity-cli Issue #1245](https://github.com/google-antigravity/antigravity-cli/issues/1245)**
   官方仓库中关于上下文窗口实际生效范围的 Issue 讨论，为本项目最初确认"256K 行为需要独立验证"提供了重要切入点。
-- **[afengblog：antigravity 256K 上下文差异分析](https://afengblog.com/blog/antigravity-256k-context-discrepancy.html)**
+- **[afengblog：Google Antigravity 256K 上下文窗口限制与无头模式政策变更](https://afengblog.com/blog/antigravity-256k-context-discrepancy.html)**
   对 `agy` 上下文容量与实际压缩点之间差异的整理，为本项目梳理"多种 Token 计数口径"提供了参考视角。
 - **[linux.do 讨论帖 topic/3117832](https://linux.do/t/topic/3117832)**
   社区中对相关现象的实测交流与经验分享，为实验方向的取舍提供了帮助。
 
-> 上述来源仅作为问题线索与背景参考。本仓库的结论、反汇编分析、补丁实现与实测数据均为独立取证所得，相关判断与证据边界已在 [docs/](docs/) 下的技术报告中完整披露。
+在机制梳理、脚本实现、文档撰写与实测验证中，主要工作由以下大语言模型完成：**Gemini 3.8 Flash**、**Gemini 4 Argon**、**DeepSeek V4.1 Flash 1017** 与 **GPT-6.1 Sol**；仓库维护者仅提供了需求设定、运行环境与实机测试条件等协助。谨致谢意。
 
 ---
 
