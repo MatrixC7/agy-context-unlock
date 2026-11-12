@@ -2,10 +2,10 @@
 
 **解除 `antigravity-cli`（`agy`）的 256K 本地上下文自动压缩限制，恢复 `/model` 交互菜单与 `settings.json` 的持久化上下文窗口配置（支持 Google OAuth 原生通道与企业网关自定义模型）。**
 
-- **适用软件**：`antigravity-cli`（命令行工具 `/usr/bin/agy`，**非** Antigravity 桌面端 IDE）
+- **适用软件**：`antigravity-cli`（命令行工具 `/usr/bin/agy`，**非** Antigravity 桌面端 IDE；桌面端请参阅 [`antigravity-context-unlock`](https://github.com/MatrixC7/antigravity-context-unlock)）
 - **已验证版本**：`1.5.1` Linux x86-64（`SHA256: 72738cf0445918483956a5f0da33abdfcfb21a12dd9a421fd57d063782826669`），并通过动态解析 Go `pclntab` 符号表支持跨小版本定位
 - **支持通道与模型**：
-  - **Google OAuth 原生通道**（`daily-cloudcode-pa.googleapis.com`）：`Gemini 4 Argon`、`Gemini 3.8 Flash` 等原生模型
+  - **Google OAuth 原生通道**（`daily-cloudcode-pa.googleapis.com`）：`Gemini 4 Carbon`、`Gemini 4 Argon`、`Gemini 3.8 Flash`、`Claude 5.5` 等原生模型
   - **企业网关 / 自定义模型通道**（通过 `GOOGLE_GEMINI_BASE_URL` 或 `customModelsConfig` 接入的 `/v1beta` 兼容网关）：网关转发的 Gemini 系列与 DeepSeek 系列模型
 - **运行依赖**：仅需 Python 3 标准库（零第三方依赖）
 - **许可证**：[MIT License](LICENSE)
@@ -59,7 +59,7 @@
 首先将本仓库克隆或放置于 `~/.local/share/agy-context-unlock`，并运行只读自检：
 
 ```bash
-git clone <repository-url> ~/.local/share/agy-context-unlock
+git clone https://github.com/MatrixC7/agy-context-unlock.git ~/.local/share/agy-context-unlock
 cd ~/.local/share/agy-context-unlock
 
 # 运行离线解析与补丁签名自检（纯只读，不修改任何文件）
@@ -106,11 +106,13 @@ agy-unlock --model "Gemini 3.8 Flash (High)"
 
 ## 4. 适用场景与各通道表现对比
 
-| 接入通道 | 代表模型 | 未修补时的默认压缩点 | 修补并启用 `"900K"` 后的表现 |
+| 接入通道 | 代表模型（Low / Medium / High 思考强度同值） | 未修补时的默认预算 / 压缩点 | 修补并启用 `"900K"` 后的生效表现 |
 |---|---|---|---|
-| **Google OAuth 原生通道** | `Gemini 4 Argon (High)`<br>`Gemini 3.8 Flash (High)` | 服务端 SSE `promptTokenCount` 约 **248K**<br>（本地 SQLite `estimated_tokens_used` 显示约 **356K–369K**） | 本地预算提升至 **`900,000`**（`max_context_tokens = 900000`；实测超 840K–869K 未触发自动压缩） |
-| **企业网关 / 自定义模型通道** | `<gateway>/gemini-4-argon-high`<br>`<gateway>/gemini-3.8-flash-high` | 本地 SQLite `estimated_tokens_used` 显示约 **355K** | 本地预算提升至 **`900,000`** |
-| **企业网关 / 自定义模型通道** | `<gateway>/deepseek-v4.1-flash-1017` | 本地 SQLite `estimated_tokens_used` 显示约 **315K** | 本地预算提升至 **`900,000`**（或通过 `AGY_CLI_AUTO_COMPACT_OVERRIDE` 按上游模型实际容量设定） |
+| **Google OAuth 原生通道** | `Gemini 4 Argon`<br>`Gemini 3.8 Flash` | `max_context_tokens = 256,000`<br>（SSE `promptTokenCount` 约 **248K**，本地 DB 估算约 **356K–369K**） | 生效预算提升至 **`900,000`**（物理输入上界 `1,048,576 - 65,536 = 983,040`；实测超 840K–869K 未触发自动压缩） |
+| **Google OAuth 原生通道** | `Gemini 4 Carbon` | `max_context_tokens = 256,000` | 自动按物理输入上界钳位至 **`786,432`**（官方预留 `maxOutputTokens = 262,144`，经 `min(900000, 1048576 - 262144)` 安全生效） |
+| **Google OAuth 原生通道** | `Claude Opus 5.5`<br>`Claude Sonnet 5.5` | CLI 默认命中 `claude-1m_840k` 变体为 **`840,000`** | 自动按物理输入上界提升并钳位至 **`872,000`**（`min(900000, 1000000 - 128000)`） |
+| **企业网关 / 自定义模型通道** | `<gateway>/gemini-4-argon-high`<br>`<gateway>/gemini-3.8-flash-high` | 本地 SQLite `estimated_tokens_used` 显示约 **355K**（`maxctx = 256,000`） | 生效预算提升至 **`900,000`** |
+| **企业网关 / 自定义模型通道** | `<gateway>/deepseek-v4.1-flash-1017` | 本地 SQLite `estimated_tokens_used` 显示约 **315K**（`maxctx = 256,000`） | 生效预算提升至 **`900,000`**（或通过 `AGY_CLI_AUTO_COMPACT_OVERRIDE` 按上游模型实际容量设定） |
 
 ---
 

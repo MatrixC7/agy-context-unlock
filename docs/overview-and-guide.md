@@ -97,6 +97,24 @@
 
 ---
 
+### 1.4 不同模型家族与思考强度的官方 `maxOutputTokens` 差异：为什么设为 `"900K"` 后 `Gemini 4 Carbon` 生效为 `786,432`？
+
+在 `agy` 内部的 `GetCascadeConversationalConfigWithExperiment` 配置组装链路中，客户端写入的 `"900K"`（`900,000`）经合并后会执行 `utils.ClampCheckpointConfigForModelInfo` 模型物理上界检查：
+
+$$\text{最终生效预算} = \min\big(\text{用户设定值},\ \text{MaxTokens} - \text{MaxOutputTokens}\big)$$
+
+实测官方目录（`GetAvailableModels`）表明：**同一模型家族内部，Low / Medium / High 三种思考强度的 `maxOutputTokens` 完全相同**（思考强度仅改变独立的 `thinkingLevel = 1 / 2 / 3` 字段），但不同模型代际的单次最大输出预留存在三档差异：
+
+| 原生通道模型家族（Low / Medium / High 同值） | 官方总窗口 `maxTokens` | 官方最大输出 `maxOutputTokens` | 物理输入上界 `maxTokens - maxOutputTokens` | 未设档位默认预算 | 设为 `"900K"` 后的生效预算 |
+|---|---:|---:|---:|---:|---:|
+| **Gemini 4 Argon / Gemini 3.8 Flash** | `1,048,576` (1 Mi) | **`65,536`** (64 Ki) | `983,040` | `256,000` | **`900,000`** *(注)* |
+| **Claude Opus 5.5 / Claude Sonnet 5.5** | `1,000,000` (1M) | **`128,000`** (128K) | `872,000` | `840,000`（`claude-1m_840k`） | **`872,000`** |
+| **Gemini 4 Carbon** | `1,048,576` (1 Mi) | **`262,144`** (256 Ki) | `786,432` | `256,000` | **`786,432`** |
+
+> *注*：若需在 Argon / Flash 上进一步释放 `900,000` 至物理上界 `983,040` 之间的余量，可通过 `AGY_CLI_AUTO_COMPACT_OVERRIDE=983040` 指定，引擎同样会在安全上界内生效。对于单次最大输出扩展至 `262,144`（256 Ki）的 `Gemini 4 Carbon`，引擎自动将 `"900K"` 钳位在 `786,432` 是为了给单轮输出预留充足空间，不会触发内部校验错误。
+
+---
+
 ## 2. 两条通道对比：Google OAuth 原生通道 vs. 企业网关通道
 
 `agy` 支持通过 Google 账号 OAuth 登录直连官方通道，也支持通过环境变量（`GOOGLE_GEMINI_BASE_URL` 与 `GEMINI_API_KEY`）或 `customModelsConfig` 接入本地或企业内部的兼容 API 网关。两条通道的上下文机制对比如下：
@@ -127,4 +145,4 @@
      - **客户端发送层（已证实）**：通过消息对象哈希比对与 128-bit 随机事实“大海捞针（needle）”测试，已证实客户端在压缩前发出的 JSON 请求体完整保留了历史消息。
      - **服务端内部推理层（不可直接观测）**：由于外部无法获取上游云端推理引擎的内部日志，`HTTP 200` 与 `reason = 0`（仅代表客户端未标记本地压缩）不能作为云端内部零转换的绝对证明。
 4. **误区：“将本地上限调至 `900K` 后，任何模型都能无条件跑到 `900K`！”**
-   - **客观事实**：客户端补丁解除了 `agy` 本地的 256K 自动摘要锁。对于原生或网关下的 Gemini 3.8 / 4（标称容量 `1,048,576`），设置 `900K` 预留了充足的输出余量；但若在网关下调用本身物理窗口较小（如 128K 或 256K）的其他第三方模型，当请求超过上游模型的真实物理上限时，上游 API 将返回超限错误。此时可通过 `AGY_CLI_AUTO_COMPACT_OVERRIDE=<合适阈值>` 或 `/model` 里的 `256K`/`512K` 档位按需匹配模型容量。
+   - **客观事实**：客户端补丁解除了 `agy` 本地的 256K 自动摘要锁。对于原生通道模型，引擎仍会按 `MaxTokens - MaxOutputTokens` 自动保护输出预留（例如 Argon / Flash 为 `900,000`，Claude 5.5 自动钳位至 `872,000`，预留 256 Ki 输出的 Gemini 4 Carbon 自动钳位至 `786,432`）；但在企业网关下调用未下发真实 `maxTokens` 且物理窗口较小（如 128K 或 256K）的第三方自定义模型时，若请求超过上游模型的真实物理上限，上游 API 将返回超限错误。此时可通过 `AGY_CLI_AUTO_COMPACT_OVERRIDE=<合适阈值>` 或 `/model` 里的 `256K`/`512K` 档位按需匹配模型容量。

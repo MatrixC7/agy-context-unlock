@@ -45,7 +45,7 @@ thoughtsTokenCount, totalTokenCount, traceId, usageMetadata
 
 ### 步骤 1：身份鉴权与模型清单拉取（`v1internal:fetchAvailableModels`）
 - `agy` 启动后读取 `~/.gemini/antigravity-cli/settings.json` 与系统 Keyring 中的 OAuth 凭据，请求 `https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels`。
-- 服务端返回的模型清單中，`Gemini 4 Argon`（High/Medium/Low）与 `Gemini 3.8 Flash`（High/Medium/Low）的关键参数一致：
+- 服务端返回的模型清单中，诸如 `Gemini 4 Argon`（High/Medium/Low）与 `Gemini 3.8 Flash`（High/Medium/Low）的单条目结构示例如下：
   ```json
   {
     "id": "gemini-4-argon-high",
@@ -63,6 +63,20 @@ thoughtsTokenCount, totalTokenCount, traceId, usageMetadata
     }
   }
   ```
+- **全目录各模型家族与思考强度的 `maxOutputTokens` 实测汇总**：
+  官方目录按 `thinkingLevel`（`1 = Low`、`2 = Medium`、`3 = High`）区分思考强度，**同一模型家族内三个思考档位的 `maxOutputTokens` 恒定相同**，而跨模型家族则分为三档主流输出上限。由于引擎在合并用户窗口配置（如 `"900K"` → `900,000`）后会继续执行 `utils.ClampCheckpointConfigForModelInfo`（`0x8378600`）将其钳位在物理输入上界 `maxTokens - maxOutputTokens` 以内，各模型的实际生效预算如下：
+
+  | 模型显示名称与用途 | 模型 ID / 内部枚举 | `thinkingLevel` | `maxTokens` | 官方 `maxOutputTokens` | CLI 默认预算（未设档位） | 修补后设为 `"900K"` 生效预算（物理上界） |
+  |---|---|---:|---:|---:|---:|---:|
+  | **Gemini 4 Carbon (Low / Medium / High)** | `gemini-4-carbon-{low,medium,high}`（`M438` / `M437` / `M427`） | `1` / `2` / `3` | `1,048,576` | **`262,144`** (256 Ki) | `256,000` | **`786,432`**（上界 `786,432`） |
+  | **Gemini 4 Argon (Low / Medium / High)** | `gemini-4-argon-{low,medium,high}`（`M419` / `M418` / `M417`） | `1` / `2` / `3` | `1,048,576` | **`65,536`** (64 Ki) | `256,000` | **`900,000`**（上界 `983,040`） |
+  | **Gemini 3.8 Flash (Low / Medium / High)** | `gemini-3.8-flash-{low,medium,high}`（`M320` / `M319` / `M318`；含 `tiered` `M322`） | `1` / `2` / `3` | `1,048,576` | **`65,536`** (64 Ki) | `256,000` | **`900,000`**（上界 `983,040`） |
+  | **Claude Opus 5.5 (Low / Medium / High)** | `claude-opus-5-5-{low,medium,high}`（`M400` / `M401` / `M402`） | `1` / `2` / `3` | `1,000,000` | **`128,000`** (128K) | `840,000`（`claude-1m_840k`） | **`872,000`**（上界 `872,000`） |
+  | **Claude Sonnet 5.5 (Low / Medium / High)** | `claude-sonnet-5-5-{low,medium,high}`（`M403` / `M404` / `M405`） | `1` / `2` / `3` | `1,000,000` | **`128,000`** (128K) | `840,000`（`claude-1m_840k`） | **`872,000`**（上界 `872,000`） |
+  | Gemini 3 Flash（旧版主力） | `gemini-3-flash`（`M18`） | `3` | `1,048,576` | **`65,536`** | `128,000` | **`900,000`**（上界 `983,040`） |
+  | Gemini 3.5 / 3.1 Flash Lite & 2.5 Pro | `M198` / `M50` / `MODEL_GOOGLE_GEMINI_2_5_*` | `1`（2.5 Pro 为 `thinkingBudget=1024`） | `1,048,576` | **`65,535`** | `128,000` | **`900,000`**（上界 `983,041`） |
+  | Gemini 3.1 Flash Image / Tab 补全小模型 | `M21`（生图）/ `M19`, `M28`（Tab） | — | `65,536` / `16,384` | `65,536` / `4,096` | — | *(非主对话路径)* |
+  | GPT-OSS 120B (Medium) | `MODEL_OPENAI_GPT_OSS_120B_MEDIUM` | `thinkingBudget=8192` | `131,072` | `32,768` | `80,000` | **`98,304`**（上界 `98,304`） |
 
 ### 步骤 2：本地构造 `CheckpointConfig` 与门禁检查
 - **默认预算推导**：`utils.GetCheckpointConfig`（`0x7fb0ec0`）根据模型信息构造默认 `CheckpointConfig`，并在 `0x7fb0fe2` 处执行无符号钳位 `min(x, 256000)`，将结果写入 `CheckpointConfig.MaxTokenLimit`（偏移 `+0xc`，`0x7fb11b7`）。
