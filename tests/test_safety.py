@@ -119,6 +119,22 @@ class TestPatcherSafety(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600)
             self.assertEqual(p.read_bytes(), b"new")
 
+    def test_stale_backup_is_rotated_before_copy(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "agy"
+            src.write_bytes(b"new-binary")
+            backup = Path(td) / "agy.agy-unlock-backup"
+            backup.write_bytes(b"old-binary")
+            old_sha = hashlib.sha256(b"old-binary").hexdigest()
+            new_sha = hashlib.sha256(b"new-binary").hexdigest()
+
+            out = unlock._ensure_backup(src, new_sha)
+
+            self.assertEqual(out, backup)
+            self.assertEqual(backup.read_bytes(), b"new-binary")
+            rotated = Path(td) / f"agy.agy-unlock-backup.{old_sha[:8]}"
+            self.assertEqual(rotated.read_bytes(), b"old-binary")
+
     def test_install_window_validation(self):
         with tempfile.TemporaryDirectory() as td:
             r = subprocess.run(

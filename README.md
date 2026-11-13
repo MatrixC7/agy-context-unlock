@@ -207,6 +207,7 @@ python3 -m unittest discover -s tests -v
 - **函数边界与唯一签名校验**：每个补丁仅在目标函数自身的 `[va, end)` 地址范围内检索原始机器码，且要求唯一精确匹配；若未来版本函数指令结构发生改变，脚本将安全中止，不会破坏二进制文件。1.5.7 的 `settings-window` 签名更新即遵循这一流程。
 - **先内存应用、后原子写入**：`patch` 先对全部必选补丁做内存匹配与应用；任一失败立即返回，不写入文件，因此不会出现部分补丁落盘的状态。
 - **原子替换与自动备份**：使用 `--in-place` 修补系统二进制时，脚本会自动备份原文件至 `/usr/bin/agy.agy-unlock-backup`，并通过同目录临时文件 + `fsync` + `os.replace` 完成原子写入。
+- **旧备份自动轮换**：若已有 `.agy-unlock-backup` 与当前源二进制 SHA 不一致（典型场景：`pacman` 升级了 `agy`，但旧版本备份仍在），脚本会先把旧备份重命名为 `.agy-unlock-backup.<旧SHA前8位>`，再备份当前二进制。这样 `restore` 不会误把 1.5.7 降级回 1.5.3。
 - **一键还原原版二进制**：
   ```bash
   sudo python3 ~/.local/share/agy-context-unlock/agy_context_unlock.py restore --binary /usr/bin/agy

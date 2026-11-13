@@ -622,14 +622,36 @@ def cmd_patch(args: argparse.Namespace) -> int:
         print("error: refusing to overwrite a system binary; pass --allow-system or use install mode", file=sys.stderr)
         return 2
     if overwrites_source:
-        backup = src.with_name(src.name + ".agy-unlock-backup")
-        if not backup.exists():
-            shutil.copy2(src, backup)
-            print(f"[i] backup: {backup}")
+        _ensure_backup(src, u.sha256)
     _atomic_write(dst, bytes(u.data), src.stat().st_mode)
     print(f"[*] wrote {dst}")
     print(f"    sha256 {u.sha256} -> {hashlib.sha256(u.data).hexdigest()}")
     return 0
+
+
+
+def _ensure_backup(src: Path, source_sha: str) -> Path:
+    """Keep one backup of the *current* source binary.
+
+    A package upgrade replaces /usr/bin/agy but leaves the old
+    ``.agy-unlock-backup`` in place.  Blindly reusing that stale file would make
+    ``restore`` downgrade the CLI to a previous version, so rotate a mismatching
+    backup to ``<backup>.<old-sha8>`` before copying the current binary.
+    """
+    backup = src.with_name(src.name + ".agy-unlock-backup")
+    if backup.exists():
+        old_sha = hashlib.sha256(backup.read_bytes()).hexdigest()
+        if old_sha != source_sha:
+            rotated = backup.with_name(f"{backup.name}.{old_sha[:8]}")
+            if rotated.exists():
+                backup.unlink()
+            else:
+                os.replace(backup, rotated)
+            print(f"[i] rotated stale backup: {rotated}")
+    if not backup.exists():
+        shutil.copy2(src, backup)
+        print(f"[i] backup: {backup}")
+    return backup
 
 
 def _atomic_write(path: Path, data: bytes, mode: int) -> None:

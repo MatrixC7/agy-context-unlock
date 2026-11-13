@@ -237,6 +237,8 @@
 
 这是因为旧签名覆盖了 `featureProvider` 的字段读取指令，而该结构体字段发生了位移。脚本的 `cmd_patch` 会先在内存中应用全部补丁，任一必选补丁失败即返回，**不会写回文件**，因此不会留下部分修补的二进制。
 
+此外，`--in-place` 现在会检查已有 `.agy-unlock-backup` 的 SHA 是否与当前源二进制一致；不一致时先把旧备份轮换为 `.agy-unlock-backup.<旧SHA前8位>`，再备份当前 1.5.7，避免 `restore` 恢复到升级前的旧版本。
+
 修复后对 1.5.7 原版与修补版的 GDB 零 Token 验证结果：
 
 | 二进制 | `CTXWINDOW_STRING_LEN` | `CTXWINDOW_LIMIT` | `PROTO_EQUAL` | `WRITE_MAXTOKEN` |
