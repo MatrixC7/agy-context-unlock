@@ -20,7 +20,7 @@ import agy_context_unlock as unlock  # noqa: E402
 import verify_live as verify  # noqa: E402
 
 BIN = Path("/usr/bin/agy")
-HAS_TARGET = BIN.exists() and hashlib.sha256(BIN.read_bytes()).hexdigest().startswith("72738cf044591848")
+HAS_TARGET = BIN.exists() and hashlib.sha256(BIN.read_bytes()).hexdigest().startswith("5df525a2d6908989")
 
 
 class TestCompactionSummary(unittest.TestCase):

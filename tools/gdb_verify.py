@@ -2,8 +2,13 @@
 """Zero-token GDB verification for agy context window resolution.
 
 Starts agy under GDB, records the resolved context window registers inside
-backend.(*ServerBackend).buildCascadeConfigInternal, and kills the process at
-0x98890fb BEFORE any network model request is sent (0 token cost).
+backend.(*ServerBackend).buildCascadeConfigInternal, and kills the process just
+before the config function returns -- BEFORE any generation request is sent
+(0 token cost).
+
+The five breakpoint offsets are derived from the model-gate patch signature, so
+the tool does not embed absolute build addresses and keeps working when a minor
+agy release shifts the function.
 
 Usage:
   python3 tools/gdb_verify.py --binary /usr/bin/agy
@@ -20,12 +25,22 @@ import sys
 import tempfile
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+import agy_context_unlock as unlock  # noqa: E402
+
 GDB_INNER_SCRIPT = r"""
 import gdb, json, os, shlex
 
 out = os.environ['GDB_VERIFY_OUT']
 bin_real = os.path.realpath(os.environ['GDB_VERIFY_BIN'])
 res = {'events': [], 'status': 'not_started'}
+
+OFF_STRING_LEN = int(os.environ['GDB_VERIFY_OFF_STRING_LEN'], 0)
+OFF_LIMIT = int(os.environ['GDB_VERIFY_OFF_LIMIT'], 0)
+OFF_PROTO = int(os.environ['GDB_VERIFY_OFF_PROTO'], 0)
+OFF_WRITE = int(os.environ['GDB_VERIFY_OFF_WRITE'], 0)
+OFF_RETURN = int(os.environ['GDB_VERIFY_OFF_RETURN'], 0)
 
 for c in (
     'set pagination off',
@@ -52,7 +67,7 @@ if base is None:
 else:
     res['pie_base'] = hex(base)
     points = {}
-    for off in (0x9889068, 0x988906d, 0x98890a9, 0x98890c9, 0x98890fb):
+    for off in (OFF_STRING_LEN, OFF_LIMIT, OFF_PROTO, OFF_WRITE, OFF_RETURN):
         bp = gdb.Breakpoint(f'*{base + off:#x}', internal=True)
         bp.silent = True
         points[base + off] = off
@@ -62,15 +77,15 @@ else:
             res['status'] = 'exited_before_config'
             break
         off = points.get(int(gdb.parse_and_eval('$pc')))
-        if off == 0x9889068:
+        if off == OFF_STRING_LEN:
             res['events'].append({'name': 'CTXWINDOW_STRING_LEN', 'value': int(gdb.parse_and_eval('$rbx'))})
-        elif off == 0x988906d:
+        elif off == OFF_LIMIT:
             res['events'].append({'name': 'CTXWINDOW_LIMIT', 'value': int(gdb.parse_and_eval('$eax'))})
-        elif off == 0x98890a9:
+        elif off == OFF_PROTO:
             res['events'].append({'name': 'PROTO_EQUAL', 'value': int(gdb.parse_and_eval('$al'))})
-        elif off == 0x98890c9:
+        elif off == OFF_WRITE:
             res['events'].append({'name': 'WRITE_MAXTOKEN', 'value': int(gdb.parse_and_eval('$ecx'))})
-        elif off == 0x98890fb:
+        elif off == OFF_RETURN:
             res['events'].append({'name': 'CONFIG_RETURN_BEFORE_REQUEST', 'value': 1})
             gdb.execute('kill', to_string=True)
             res['status'] = 'killed_before_config_return'
@@ -98,6 +113,28 @@ def main() -> int:
         print(f"error: binary not found: {binary}", file=sys.stderr)
         return 2
 
+    # Locate the model-gate site dynamically.  The other four breakpoints keep a
+    # stable relative layout inside buildCascadeConfigInternal:
+    #   context-window string length  = site - 0x41
+    #   parsed MaxTokenLimit          = site - 0x3c
+    #   proto.Equal result            = site
+    #   CheckpointConfig write        = site + 0x20
+    #   function return point         = site + 0x52
+    try:
+        u = unlock.Unlocker(binary)
+        gate = next(p for p in unlock.PATCHES if p.key == "model-gate")
+        _gate_off, gate_va = u.locate_patch(gate)
+    except Exception as exc:  # BinaryError, OSError, StopIteration
+        print(f"error: cannot locate model-gate in {binary}: {exc}", file=sys.stderr)
+        return 2
+    offsets = {
+        "GDB_VERIFY_OFF_STRING_LEN": gate_va - 0x41,
+        "GDB_VERIFY_OFF_LIMIT": gate_va - 0x3c,
+        "GDB_VERIFY_OFF_PROTO": gate_va,
+        "GDB_VERIFY_OFF_WRITE": gate_va + 0x20,
+        "GDB_VERIFY_OFF_RETURN": gate_va + 0x52,
+    }
+
     models = [m.strip() for m in args.models.split(",") if m.strip()]
     with tempfile.TemporaryDirectory(prefix="agy-gdb-verify-") as work:
         script_path = Path(work) / "gdb_inner.py"
@@ -116,6 +153,8 @@ def main() -> int:
             env["GDB_VERIFY_OUT"] = str(out_path)
             env["GDB_VERIFY_BIN"] = str(binary)
             env["GDB_VERIFY_MODEL"] = model
+            for key, value in offsets.items():
+                env[key] = hex(value)
 
             subprocess.run(
                 [

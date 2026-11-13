@@ -1,5 +1,7 @@
 # 技术报告：企业网关与自定义模型上下文处理机制
 
+> **历史实验记录**：本文的逐轮实测数据与反汇编地址均来自 `antigravity-cli` 1.5.1；1.5.7 的 `settings-window` 签名、结构体偏移与锚点地址变更见 [《二进制补丁与脚本实现详解》](binary-patch-internals.md)。除签名位移外，1.5.7 的上下文压缩机制与默认 256K 预算未变。
+
 > **测试对象**：`antigravity-cli`（`/usr/bin/agy`）`1.5.1`，Linux x86-64，`SHA256: 72738cf0445918483956a5f0da33abdfcfb21a12dd9a421fd57d063782826669`。
 > **测试通道**：通过 `GOOGLE_GEMINI_BASE_URL` 与 `GEMINI_API_KEY`（或 `customModelsConfig`）接入的 `/v1beta` 兼容企业网关通道。
 > **覆盖模型**：`<gateway>/gemini-4-argon-high`、`<gateway>/gemini-3.8-flash-high`、`<gateway>/deepseek-v4.1-flash-1017`。

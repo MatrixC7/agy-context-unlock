@@ -1,5 +1,7 @@
 # 原理与使用指南：`antigravity-cli`（`agy`）的上下文压缩机制与解锁方案
 
+> **版本说明**：本文档的补丁地址与调用链已更新至 `antigravity-cli` 1.5.7；第 1.2、1.4 与第 2 节的逐轮 Token 实验数值来自 1.5.1 原始记录，1.5.7 的相关控制流与默认 256K 预算在静态结构上未变，1.5.1 的实测结论继续适用。1.5.7 更新前的补丁线保存在标签 `v1.5.5`。
+>
 > 本文档面向希望快速理解 `antigravity-cli`（`agy`）上下文限制成因、持久化配置逻辑以及解锁原理的用户与开发者。底层反汇编地址与逐轮抓包原始数据请参阅配套技术报告：
 > - [《二进制补丁与脚本实现详解》（`binary-patch-internals.md`）](binary-patch-internals.md)
 > - [《技术报告：Google OAuth 原生通道上下文机制与实测数据》（`mechanism-native-oauth.md`）](mechanism-native-oauth.md)
@@ -67,32 +69,32 @@
   按 [Enter] 确认 ──► SelectorModel.selectRow ──► SelectorModel.windowToSave
        │
        ▼
-  调用 store.(*Manager).SetContextWindow (0x9c34e00)
+  调用 store.(*Manager).SetContextWindow (0xa3fe160)
        │
        ▼
-  调用 store.(*Manager).WriteCliSettings (0x9c26280)
+  调用 store.(*Manager).WriteCliSettings (0xa3ee620)
        └──► 将 {"contextWindow": "900K"} 写入磁盘文件 ~/.gemini/antigravity-cli/settings.json
 
 【下半场：从 settings.json 读取并写入压缩预算（原版被三处门禁阻断，由本项目补丁打通）】
-  每次启动 agy 或切换模型 ──► 调用 store.(*Manager).syncContextWindow (0x9c34fa0)
+  每次启动 agy 或切换模型 ──► 调用 store.(*Manager).syncContextWindow (0xa3fe300)
        │
        ▼
-  调用 store.(*Store).ContextWindow (0x9c34b80)
+  调用 store.(*Store).ContextWindow (0xa3fdee0)
        ├──► 门禁 1：检查 "Gemini 4 Argon" 单模型白名单  ──► [补丁 store-gate 放行所有模型]
        ├──► 优先检查环境变量 AGY_CLI_AUTO_COMPACT_OVERRIDE（若设置则优先返回）
        └──► 门禁 2：未设环境变量时的回退分支原本被内部 Feature Flag 封死，直接返回 ""
-            └──► [补丁 settings-window 将该分支接入 store.(*Store).ContextWindowChoice (0x9c34b40)]
+            └──► [补丁 settings-window 将该分支接入 store.(*Store).ContextWindowChoice (0xa3fdea0)]
             └──► 直接读取 ~/.gemini/antigravity-cli/settings.json 中的 "contextWindow": "900K"！
        │
        ▼
-  调用 backend.(*ServerBackend).buildCascadeConfigInternal (0x9888380)
+  调用 backend.(*ServerBackend).buildCascadeConfigInternal (0xa08c3a0)
        ├──► ContextWindow.MaxTokenLimit() 将 "900K" 解析为整数 900000
        ├──► 门禁 3：检查 proto.Equal(model, selectedOverride) ──► [补丁 model-gate 改为无条件写入]
        └──► 将 900000 写入 CheckpointConfig.MaxTokenLimit (+0xc)！
 ```
 
 简言之：
-- 在**未修补的原版 `agy` 1.5.1** 中，不仅 `/model` 里的 `[Tab] Context` 按钮对绝大多数模型隐藏（被 `offersContextWindow` 门禁挡住），而且就算手动在 `settings.json` 里写上 `"contextWindow": "900K"`，读取函数 `Store.ContextWindow` 也会因为内部 Feature Flag 关闭而直接返回空字符串，导致配置形同虚设。
+- 在**未修补的原版 `agy` 1.5.7** 中，不仅 `/model` 里的 `[Tab] Context` 按钮对绝大多数模型隐藏（被 `offersContextWindow` 门禁挡住），而且就算手动在 `settings.json` 里写上 `"contextWindow": "900K"`，读取函数 `Store.ContextWindow` 也会因为内部 Feature Flag 关闭而直接返回空字符串，导致配置形同虚设。
 - 在**应用本项目的 4 个核心补丁（共 20 字节）**后，上述“UI 切换 → 写入 `settings.json` → 启动时自动从 `settings.json` 读取 → 写入 `CheckpointConfig.MaxTokenLimit`”形成完整闭环。用户既可以在 `/model` 菜单中按 `Tab` + `Enter` 永久切换档位，也可以直接编辑 `settings.json`，**日常使用完全无需手动指定环境变量**。
 
 ---
@@ -123,7 +125,7 @@ $$\text{最终生效预算} = \min\big(\text{用户设定值},\ \text{MaxTokens}
 |---|---|---|
 | **通信协议与端点** | HTTPS 访问 `daily-cloudcode-pa.googleapis.com/v1internal:*` | HTTP/HTTPS 访问网关 `/v1beta/models/*:streamGenerateContent` |
 | **模型清单返回内容** | `fetchAvailableModels` 下发 `maxTokens=1,048,576` 及实验策略 `max_token_limit=256000` | `/v1beta/models` 仅返回模型名称与描述，不下发 `maxTokens` 与 Checkpoint 策略 |
-| **默认 `256,000` 预算的来源** | 来自服务端下发的实验策略值 + 本地兜底 | 客户端将网关模型识别为 **Custom Model（自定义模型）**，执行本地默认推导并经 `min(x, 256000)`（`0x7fb0fe2`）钳位为 `256,000` |
+| **默认 `256,000` 预算的来源** | 来自服务端下发的实验策略值 + 本地兜底 | 客户端将网关模型识别为 **Custom Model（自定义模型）**，执行本地默认推导并经 `min(x, 256000)`（`0x84f5e02`）钳位为 `256,000` |
 | **请求体是否含上限配置** | 否（主请求无 `checkpoint_config` 字段） | 否（主请求仅含 `contents`、`tools`、`generationConfig`、`systemInstruction`） |
 | **自动压缩执行方** | `agy` 客户端本地发起 | `agy` 客户端本地发起 |
 | **未修补时的压缩点（DB 估算）** | Argon / Flash：约 **`356K–369K`**（SSE 约 `248K`） | Argon / Flash：**`355,610` / `355,586`**<br>DeepSeek V4.1 Flash：**`315,097`** |

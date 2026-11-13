@@ -1,5 +1,7 @@
 # 技术报告：Google OAuth 原生通道上下文处理机制与实测数据
 
+> **历史实验记录**：本文的逐轮实测数据与反汇编地址均来自 `antigravity-cli` 1.5.1；1.5.7 的 `settings-window` 签名、结构体偏移与锚点地址变更见 [《二进制补丁与脚本实现详解》](binary-patch-internals.md)。除签名位移外，1.5.7 的上下文压缩机制与默认 256K 预算未变。
+
 > **测试对象**：`antigravity-cli`（`/usr/bin/agy`）`1.5.1`，Linux x86-64，`SHA256: 72738cf0445918483956a5f0da33abdfcfb21a12dd9a421fd57d063782826669`。
 > **测试通道**：Google 账号 OAuth 原生通道（`daily-cloudcode-pa.googleapis.com`）。
 > **覆盖模型**：`Gemini 4 Argon (High)`、`Gemini 3.8 Flash (High)`。

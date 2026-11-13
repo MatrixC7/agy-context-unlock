@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """agy-context-unlock: unlock >256K context window in antigravity-cli (agy).
 
-Verified mechanism (antigravity-cli 1.5.1, Linux x86-64)
+Verified mechanism (antigravity-cli 1.5.7, Linux x86-64)
 --------------------------------------------------------
 1. Context auto-compaction (checkpointing) in ``agy`` is triggered **locally by
    the CLI client** (``checkpoint.shouldCheckpoint`` /
@@ -9,7 +9,7 @@ Verified mechanism (antigravity-cli 1.5.1, Linux x86-64)
    upstream model API on main generation requests.  When the local token budget
    is reached, ``agy`` sends a separate continuation-summary request, records a
    local ``type=23`` checkpoint step in SQLite, and replaces older history.
-2. In unpatched ``agy`` 1.5.1, ``~/.gemini/antigravity-cli/settings.json``'s
+2. In unpatched ``agy`` 1.5.7, ``~/.gemini/antigravity-cli/settings.json``'s
    ``"contextWindow": "900K"`` does not take effect on the default path, and
    ``AGY_CLI_AUTO_COMPACT_OVERRIDE`` only works for ``"Gemini 4 Argon"`` due to
    a hardcoded one-model whitelist in ``store.(*Store).ContextWindow``.
@@ -24,12 +24,14 @@ What the four core binary patches do (20 bytes total)
    so every native Gemini and enterprise-gateway (``<gateway>/<model>``) custom
    model passes the gate.
 3. ``settings-window`` (``store.(*Store).ContextWindow``, 8 bytes):
-   Wires the post-env fallback branch (at ``0x9c34ca5``) to call
-   ``store.(*Store).ContextWindowChoice`` (``0x9c34b40``), which reads and
-   validates ``settings.json``'s ``"contextWindow"`` (``"256K"`` / ``"512K"`` /
+   Wires the post-env fallback branch to call
+   ``store.(*Store).ContextWindowChoice``, which reads and validates
+   ``settings.json``'s ``"contextWindow"`` (``"256K"`` / ``"512K"`` /
    ``"900K"``).  With this patch, ``settings.json`` and interactive ``/model``
    selections work directly without requiring environment variables, while
    ``AGY_CLI_AUTO_COMPACT_OVERRIDE`` retains highest priority when set.
+   In 1.5.7 the ``featureProvider`` field moved from ``+0xb8`` to ``+0x58``,
+   so the 14-byte instruction signature is version-specific (see ``PATCHES``).
 4. ``model-gate`` (``backend.(*ServerBackend).buildCascadeConfigInternal``, 1 byte):
    Changes the ``proto.Equal`` conditional jump (``jne`` -> ``jmp``) so any
    non-zero resolved context window is unconditionally written into
@@ -55,9 +57,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-PROJECT_VERSION = "2.0.0"
-TARGET_VERSION = "1.5.1"
-TARGET_SHA256_PREFIX = "72738cf044591848"
+PROJECT_VERSION = "2.1.0"
+TARGET_VERSION = "1.5.7"
+TARGET_SHA256_PREFIX = "5df525a2d6908989"
 GO_MAGICS = (0xFFFFFFF1, 0xFFFFFFF0)  # Go 1.18+ primary layout; 0xFFFFFFF0 kept as constant
 DEFAULT_WINDOW = 900_000
 MAX_WINDOW = 1_000_000
@@ -385,7 +387,7 @@ PATCHES: List[Patch] = [
     Patch(
         key="settings-window",
         symbol="store.(*Store).ContextWindow",
-        old=bytes.fromhex("48 8b 8c 24 08 01 00 00 48 8b 89 b8 00 00 00"),
+        old=bytes.fromhex("48 8b 8c 24 08 01 00 00 48 8b 49 58"),
         new=bytes.fromhex("48 8b 84 24 08 01 00 00 e8 8e fe ff ff c9 c3"),
         description="Context override: fall back to settings.json contextWindow (ContextWindowChoice)",
     ),
@@ -700,11 +702,11 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     checks = []
 
     anchors = {
-        "model.SelectorModel.offersContextWindow": 0x9E872E0,
-        "store.(*Store).ContextWindowChoice": 0x9C34B40,
-        "store.(*Store).ContextWindow": 0x9C34B80,
-        "backend.(*ServerBackend).buildCascadeConfigInternal": 0x9888380,
-        "utils.GetCheckpointConfig": 0x7FB0EC0,
+        "model.SelectorModel.offersContextWindow": 0xA6A03C0,
+        "store.(*Store).ContextWindowChoice": 0xA3FDEA0,
+        "store.(*Store).ContextWindow": 0xA3FDEE0,
+        "backend.(*ServerBackend).buildCascadeConfigInternal": 0xA08C3A0,
+        "utils.GetCheckpointConfig": 0x84F5CE0,
     }
     for name, want in anchors.items():
         got = syms.find(name).va
@@ -712,11 +714,22 @@ def cmd_self_test(args: argparse.Namespace) -> int:
 
     u = Unlocker(path)
     before = bytes(u.data)
-    for p in [q for q in PATCHES if not q.optional]:
+    required = [p for p in PATCHES if not p.optional]
+
+    # Count the bytes that each patch would actually change.  We cannot zip
+    # p.old/p.new: settings-window matches 14 bytes but writes 15 (the trailing
+    # "ret" replaces the byte after the old signature).
+    base = bytearray(before)
+    expected = 0
+    for p in required:
+        off, site_va = u.locate_patch(p)
+        new_bytes = u._resolve_patch_new_bytes(p, site_va)
+        expected += sum(1 for i, b in enumerate(new_bytes) if base[off + i] != b)
+
+    for p in required:
         u.apply(p)
     after = bytes(u.data)
     diff = [i for i in range(len(before)) if before[i] != after[i]]
-    expected = sum(sum(a != b for a, b in zip(p.old, p.new)) for p in PATCHES if not p.optional)
     checks.append(("patched byte count", len(diff) == expected, f"{len(diff)} bytes (want {expected})"))
 
     ok = True
@@ -882,7 +895,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         for p in [q for q in PATCHES if not q.optional]:
             u.apply(p)
         data = bytes(u.data)
-        applied = [p.key for p in PATCHES if not q.optional]
+        applied = [p.key for p in PATCHES if not p.optional]
         _atomic_write(installed, data, src.stat().st_mode)
         bin_path = str(installed)
         note = " (patched, locked read-only to stop the auto-updater)"
@@ -945,7 +958,7 @@ def cmd_install(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="agy-context-unlock",
-        description="Unlock >256K context window in antigravity-cli (agy 1.5.1 Linux x86-64).",
+        description="Unlock >256K context window in antigravity-cli (agy 1.5.7 Linux x86-64).",
     )
     ap.add_argument("--version", action="version", version=f"%(prog)s {PROJECT_VERSION}")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -967,7 +980,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--patches", help="comma-separated subset: ui-selector,store-gate,settings-window,model-gate,default-clamp")
     p.add_argument("--with-default-clamp", action="store_true", help="also raise the local 256000 fallback cap to 1048576")
-    p.add_argument("--allow-unknown", action="store_true", help="allow a binary whose SHA256 is not the verified 1.5.1 build")
+    p.add_argument("--allow-unknown", action="store_true", help="allow a binary whose SHA256 is not the verified 1.5.7 build")
     p.set_defaults(func=cmd_patch)
 
     p = sub.add_parser("verify", help="verify required patches in a binary")
@@ -997,7 +1010,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scope", default="native-gemini", choices=["native-gemini", "all"], help="who gets the launcher env override")
     p.add_argument("--shadow", action="store_true", help="also create PREFIX/bin/agy wrapper")
     p.add_argument("--patch", action="store_true", help="also apply the binary patches to the installed copy")
-    p.add_argument("--allow-unknown", action="store_true", help="allow a binary whose SHA256 is not the verified 1.5.1 build")
+    p.add_argument("--allow-unknown", action="store_true", help="allow a binary whose SHA256 is not the verified 1.5.7 build")
     p.set_defaults(func=cmd_install)
     return ap
 
