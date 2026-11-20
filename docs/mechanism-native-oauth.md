@@ -5,7 +5,7 @@
 > **测试对象**：`antigravity-cli`（`/usr/bin/agy`）`1.5.1`，Linux x86-64，`SHA256: 72738cf0445918483956a5f0da33abdfcfb21a12dd9a421fd57d063782826669`。
 > **测试通道**：Google 账号 OAuth 原生通道（`daily-cloudcode-pa.googleapis.com`）。
 > **覆盖模型**：`Gemini 4 Argon (High)`、`Gemini 3.8 Flash (High)`。
-> **通俗导读**：如需快速了解结论与配置方法，请参阅 [《原理与使用指南》](overview-and-guide.md)。
+> **关联文档**：如需快速了解结论与配置方法，请参阅 [《原理与使用指南》](overview-and-guide.md)；完整命令选项与支持契约见 [《CLI 命令参考、安全机制与支持契约》](cli-and-support-scope.md)。
 
 ---
 

@@ -5,7 +5,7 @@
 > **测试对象**：`antigravity-cli`（`/usr/bin/agy`）`1.5.1`，Linux x86-64，`SHA256: 72738cf0445918483956a5f0da33abdfcfb21a12dd9a421fd57d063782826669`。
 > **测试通道**：通过 `GOOGLE_GEMINI_BASE_URL` 与 `GEMINI_API_KEY`（或 `customModelsConfig`）接入的 `/v1beta` 兼容企业网关通道。
 > **覆盖模型**：`<gateway>/gemini-4-argon-high`、`<gateway>/gemini-3.8-flash-high`、`<gateway>/deepseek-v4.1-flash-1017`。
-> **通俗导读**：如需快速了解结论与配置方法，请参阅 [《原理与使用指南》](overview-and-guide.md)。
+> **关联文档**：如需快速了解结论与配置方法，请参阅 [《原理与使用指南》](overview-and-guide.md)；完整命令选项与支持契约见 [《CLI 命令参考、安全机制与支持契约》](cli-and-support-scope.md)。
 
 ---
 

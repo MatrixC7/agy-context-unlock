@@ -2,10 +2,10 @@
 
 > **版本说明**：本文档的补丁地址与调用链已更新至 `antigravity-cli` 1.5.7；第 1.2、1.4 与第 2 节的逐轮 Token 实验数值来自 1.5.1 原始记录，1.5.7 的相关控制流与默认 256K 预算在静态结构上未变，1.5.1 的实测结论继续适用。1.5.7 更新前的补丁线保存在标签 `v1.5.5`。
 >
-> 本文档面向希望快速理解 `antigravity-cli`（`agy`）上下文限制成因、持久化配置逻辑以及解锁原理的用户与开发者。底层反汇编地址与逐轮抓包原始数据请参阅配套技术报告：
-> - [《二进制补丁与脚本实现详解》（`binary-patch-internals.md`）](binary-patch-internals.md)
-> - [《技术报告：Google OAuth 原生通道上下文机制与实测数据》（`mechanism-native-oauth.md`）](mechanism-native-oauth.md)
-> - [《技术报告：企业网关与自定义模型上下文机制与实测数据》（`mechanism-enterprise-gateway.md`）](mechanism-enterprise-gateway.md)
+> 本文档面向希望快速理解 `antigravity-cli`（`agy`）上下文限制成因、持久化配置逻辑以及解锁原理的用户与开发者。配套文档导航：
+> - 全部命令选项、部署方式、验证工具与退出码契约见 [《CLI 命令参考、安全机制与支持契约》（`cli-and-support-scope.md`）](cli-and-support-scope.md)
+> - 底层 ELF64 / Go `pclntab` 解析与 20 字节补丁反汇编细节见 [《二进制补丁与脚本实现详解》（`binary-patch-internals.md`）](binary-patch-internals.md)
+> - 双通道原始抓包与深度取证报告见 [《Google OAuth 原生通道技术报告》（`mechanism-native-oauth.md`）](mechanism-native-oauth.md) 与 [《企业网关通道技术报告》（`mechanism-enterprise-gateway.md`）](mechanism-enterprise-gateway.md)
 
 ---
 
@@ -84,13 +84,13 @@
        ├──► 优先检查环境变量 AGY_CLI_AUTO_COMPACT_OVERRIDE（若设置则优先返回）
        └──► 门禁 2：未设环境变量时的回退分支原本被内部 Feature Flag 封死，直接返回 ""
             └──► [补丁 settings-window 将该分支接入 store.(*Store).ContextWindowChoice (0xa3fdea0)]
-            └──► 直接读取 ~/.gemini/antigravity-cli/settings.json 中的 "contextWindow": "900K"！
+            └──► 直接读取 ~/.gemini/antigravity-cli/settings.json 中的 "contextWindow": "900K"
        │
        ▼
   调用 backend.(*ServerBackend).buildCascadeConfigInternal (0xa08c3a0)
        ├──► ContextWindow.MaxTokenLimit() 将 "900K" 解析为整数 900000
        ├──► 门禁 3：检查 proto.Equal(model, selectedOverride) ──► [补丁 model-gate 改为无条件写入]
-       └──► 将 900000 写入 CheckpointConfig.MaxTokenLimit (+0xc)！
+       └──► 将 900000 写入 CheckpointConfig.MaxTokenLimit (+0xc)
 ```
 
 简言之：
@@ -119,7 +119,9 @@ $$\text{最终生效预算} = \min\big(\text{用户设定值},\ \text{MaxTokens}
 
 ## 2. 两条通道对比：Google OAuth 原生通道 vs. 企业网关通道
 
-`agy` 支持通过 Google 账号 OAuth 登录直连官方通道，也支持通过环境变量（`GOOGLE_GEMINI_BASE_URL` 与 `GEMINI_API_KEY`）或 `customModelsConfig` 接入本地或企业内部的兼容 API 网关。两条通道的上下文机制对比如下：
+`agy` 支持通过 Google 账号 OAuth 登录直连官方通道，也支持通过环境变量（`GOOGLE_GEMINI_BASE_URL` 与 `GEMINI_API_KEY`）或 `customModelsConfig` 接入本地或企业内部的兼容 API 网关。
+
+### 2.1 架构与机制维度对比
 
 | 对比维度 | Google OAuth 原生通道 | 企业网关 / 自定义模型通道 |
 |---|---|---|
@@ -134,17 +136,27 @@ $$\text{最终生效预算} = \min\big(\text{用户设定值},\ \text{MaxTokens}
 > **为什么企业网关下 Gemini 在约 `355K`（DB 估算）压缩，而 DeepSeek 在约 `315K` 压缩？**
 > 因为两者的本地预算虽然同为 `256,000`，但不同模型对相同文本的分词（Tokenizer）密度与用量统计比例不同，映射到客户端本地诊断估算值 `estimated_tokens_used` 时便呈现出 `355K` 与 `315K` 的差异，而非网关设置了不同的硬上限。
 
+### 2.2 各通道与代表模型实测表现对照
+
+| 接入通道 | 代表模型（Low / Medium / High 思考强度同值） | 未修补时的默认预算 / 压缩点 | 修补并启用 `"900K"` 后的生效表现 |
+|---|---|---|---|
+| **Google OAuth 原生通道** | `Gemini 4 Argon`<br>`Gemini 3.8 Flash` | `max_context_tokens = 256,000`<br>（SSE `promptTokenCount` 约 **248K**，本地 DB 估算约 **356K–369K**） | 生效预算提升至 **`900,000`**（物理输入上界 `1,048,576 - 65,536 = 983,040`；实测超 840K–869K 未触发自动压缩） |
+| **Google OAuth 原生通道** | `Gemini 4 Carbon` | `max_context_tokens = 256,000` | 自动按物理输入上界钳位至 **`786,432`**（官方预留 `maxOutputTokens = 262,144`，经 `min(900000, 1048576 - 262144)` 安全生效） |
+| **Google OAuth 原生通道** | `Claude Opus 5.5`<br>`Claude Sonnet 5.5` | CLI 默认命中 `claude-1m_840k` 变体为 **`840,000`** | 自动按物理输入上界提升并钳位至 **`872,000`**（`min(900000, 1000000 - 128000)`） |
+| **企业网关 / 自定义模型通道** | `<gateway>/gemini-4-argon-high`<br>`<gateway>/gemini-3.8-flash-high` | 本地 SQLite `estimated_tokens_used` 显示约 **355K**（`maxctx = 256,000`） | 生效预算提升至 **`900,000`** |
+| **企业网关 / 自定义模型通道** | `<gateway>/deepseek-v4.1-flash-1017` | 本地 SQLite `estimated_tokens_used` 显示约 **315K**（`maxctx = 256,000`） | 生效预算提升至 **`900,000`**（或通过 `AGY_CLI_AUTO_COMPACT_OVERRIDE` 按上游模型实际容量设定） |
+
 ---
 
 ## 3. 常见认知误区与客观边界说明
 
-1. **误区：“抓包看到 `1.1 MB` 的主请求返回了 `HTTP 200`，说明已经实测跑通了 `1M`（100 万）tokens！”**
+1. **误区：“抓包看到 `1.1 MB` 的主请求返回了 `HTTP 200`，说明已经实测跑通了 `1M`（100 万）tokens。”**
    - **客观事实**：请求体的**字节数（Bytes）不等于 Token 数**。实测 `1.08 MB`～`1.14 MB` 的 JSON 请求体，在服务端 SSE 报告的 `promptTokenCount` 中约为 **24.8 万 tokens**（对应本地数据库估算值约 `355K`–`357K`）。它证明了服务端与网关在 25 万 tokens 处不存在硬拒绝，但距离模型宣告的 `1,048,576` tokens 物理上限仍有约 4 倍差距。
-2. **误区：“触发压缩的真实公式是 `1,048,576 × 0.35 ≈ 367,002`！”**
+2. **误区：“触发压缩的真实公式是 `1,048,576 × 0.35 ≈ 367,002`。”**
    - **客观事实**：`367K` 只是本地数据库诊断估算值（`estimated_tokens_used`）在特定英文随机词填充下的经验数值区间。由于该诊断值比服务端报告的 `promptTokenCount`（`248K` → `256.5K`）高出约 40%，刚好在数值上接近 `1,048,576` 的 35%，属于跨口径对比产生的数值巧合。底层代码实际传入的预算参数正是 `256,000`。
-3. **误区：“只要数据库里 `truncation_reason = 0`，就证明服务端内部没有做任何截断！”**
+3. **误区：“只要数据库里 `truncation_reason = 0`，就证明服务端内部没有做任何截断。”**
    - **客观事实**：需分层表述证据边界：
      - **客户端发送层（已证实）**：通过消息对象哈希比对与 128-bit 随机事实“大海捞针（needle）”测试，已证实客户端在压缩前发出的 JSON 请求体完整保留了历史消息。
      - **服务端内部推理层（不可直接观测）**：由于外部无法获取上游云端推理引擎的内部日志，`HTTP 200` 与 `reason = 0`（仅代表客户端未标记本地压缩）不能作为云端内部零转换的绝对证明。
-4. **误区：“将本地上限调至 `900K` 后，任何模型都能无条件跑到 `900K`！”**
+4. **误区：“将本地上限调至 `900K` 后，任何模型都能无条件跑到 `900K`。”**
    - **客观事实**：客户端补丁解除了 `agy` 本地的 256K 自动摘要锁。对于原生通道模型，引擎仍会按 `MaxTokens - MaxOutputTokens` 自动保护输出预留（例如 Argon / Flash 为 `900,000`，Claude 5.5 自动钳位至 `872,000`，预留 256 Ki 输出的 Gemini 4 Carbon 自动钳位至 `786,432`）；但在企业网关下调用未下发真实 `maxTokens` 且物理窗口较小（如 128K 或 256K）的第三方自定义模型时，若请求超过上游模型的真实物理上限，上游 API 将返回超限错误。此时可通过 `AGY_CLI_AUTO_COMPACT_OVERRIDE=<合适阈值>` 或 `/model` 里的 `256K`/`512K` 档位按需匹配模型容量。

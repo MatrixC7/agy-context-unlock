@@ -1,7 +1,8 @@
 # Pacman PostTransaction hook for agy-context-unlock (Arch Linux / EndeavourOS / CachyOS).
 #
 # IMPORTANT: replace /path/to/agy-context-unlock below with the ABSOLUTE path
-# where you cloned this repository (for example /home/<you>/.local/share/agy-context-unlock).
+# where you cloned this repository (for example /home/<you>/agy-context-unlock,
+# or /usr/local/share/agy-context-unlock when installed as root:root).
 # A leading "~" is NOT expanded here: libalpm parses this file itself and executes
 # the command directly via execv(3), without a shell. "~" would be passed literally
 # and the hook would silently fail after every package upgrade.

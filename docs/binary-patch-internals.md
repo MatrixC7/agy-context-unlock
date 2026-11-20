@@ -2,7 +2,10 @@
 
 > 本文档面向开发者、系统管理员与逆向工程研究人员，详细说明 `agy_context_unlock.py` 的内部实现原理、Go 1.18+ 符号表动态定位算法、4 处核心补丁（20 字节）的 x86-64 反汇编前后对比，以及 `/model` 交互菜单将上下文窗口持久化至 `settings.json` 的完整调用链。
 >
-> 当前文档的地址、哈希与反汇编均以 **`antigravity-cli` 1.5.7**（Linux x86-64，`SHA256: 5df525a2d6908989c57b897723caea66e00d7c4d2e24411f91ad306989574642`）为准。1.5.7 更新前的补丁线保存在标签 **`v1.5.5`**。
+> 当前文档的地址、哈希与反汇编均以 **`antigravity-cli` 1.5.7**（Linux x86-64，`SHA256: 5df525a2d6908989c57b897723caea66e00d7c4d2e24411f91ad306989574642`）为准；1.5.7 更新前的补丁线保存在标签 **`v1.5.5`**。配套文档导航：
+> - 通俗概念导读与双通道差异见 [《原理与使用指南》（`overview-and-guide.md`）](overview-and-guide.md)
+> - 全部命令选项、部署方式、验证工具与支持契约见 [《CLI 命令参考、安全机制与支持契约》（`cli-and-support-scope.md`）](cli-and-support-scope.md)
+> - 双通道原始取证报告见 [《Google OAuth 原生通道技术报告》（`mechanism-native-oauth.md`）](mechanism-native-oauth.md) 与 [《企业网关通道技术报告》（`mechanism-enterprise-gateway.md`）](mechanism-enterprise-gateway.md)
 
 ---
 
@@ -250,25 +253,27 @@
 
 ## 6. 命令行接口参考
 
+常用命令速查如下（全部子命令参数、三种部署模式、GDB/在线验证工具、退出码契约与故障排查详见 [《CLI 命令参考、安全机制与支持契约》](cli-and-support-scope.md)）：
+
 ```bash
 # 1. 解析二进制符号表并查看各补丁位点状态（只读）
 python3 agy_context_unlock.py locate --binary /usr/bin/agy
 
-# 2. 运行离线自检，验证 5 个锚点符号地址与 20 字节精确差异（只读）
+# 2. 运行 1.5.7 锚点离线自检，验证 5 个锚点符号地址与 20 字节精确差异（只读）
 python3 agy_context_unlock.py self-test --binary /usr/bin/agy
 
 # 3. 生成修补后的二进制文件（默认输出为 /path/to/agy.patched）
 python3 agy_context_unlock.py patch --binary /usr/bin/agy --out /tmp/agy.patched
 
-# 4. 原地修补系统二进制（自动生成 /usr/bin/agy.agy-unlock-backup 备份）
-sudo python3 agy_context_unlock.py patch --binary /usr/bin/agy --in-place --yes --allow-system
+# 4. 原地修补系统二进制（自动备份/轮换 /usr/bin/agy.agy-unlock-backup；1.5.7 之后兼容版本加 --allow-unknown）
+sudo python3 agy_context_unlock.py patch --binary /usr/bin/agy --in-place --yes --allow-system --allow-unknown
 
-# 5. 校验二进制文件中的补丁是否已生效（只读）
+# 5. 校验二进制文件中的 4 处必选补丁是否已生效（只读）
 python3 agy_context_unlock.py verify --binary /usr/bin/agy
 
 # 6. 生成 Arch Linux / EndeavourOS 的 Pacman 自动更新 Hook
 sudo python3 agy_context_unlock.py pacman-hook \
-  --script-path ~/.local/share/agy-context-unlock/agy_context_unlock.py \
+  --script-path ~/agy-context-unlock/agy_context_unlock.py \
   --write /etc/pacman.d/hooks/99-agy-context-unlock.hook
 
 # 7. 从备份还原原版二进制
