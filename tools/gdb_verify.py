@@ -6,9 +6,10 @@ backend.(*ServerBackend).buildCascadeConfigInternal, and kills the process just
 before the config function returns -- BEFORE any generation request is sent
 (0 token cost).
 
-The five breakpoint offsets are derived from the model-gate patch signature, so
-the tool does not embed absolute build addresses and keeps working when a minor
-agy release shifts the function.
+The five breakpoint offsets are derived symbolically from the acp-override and
+model-gate sites inside buildCascadeConfigInternal, so the tool does not embed
+absolute build addresses and keeps working across minor agy releases
+(1.5.7..1.5.14+) even when stack-slot offsets shift.
 
 Usage:
   python3 tools/gdb_verify.py --binary /usr/bin/agy
@@ -52,7 +53,7 @@ for c in (
     gdb.execute(c, to_string=True)
 
 args = ['-p', 'Reply OK', '--model', os.environ['GDB_VERIFY_MODEL'], '--log-file', '/dev/null']
-gdb.execute('starti ' + shlex.join(args) + ' > /dev/null 2>&1', to_string=True)
+gdb.execute('starti ' + shlex.join(args) + ' < /dev/null > /dev/null 2>&1', to_string=True)
 pid = gdb.selected_inferior().pid
 base = None
 with open(f'/proc/{pid}/maps') as f:
@@ -113,26 +114,31 @@ def main() -> int:
         print(f"error: binary not found: {binary}", file=sys.stderr)
         return 2
 
-    # Locate the model-gate site dynamically.  The other four breakpoints keep a
-    # stable relative layout inside buildCascadeConfigInternal:
-    #   context-window string length  = site - 0x41
-    #   parsed MaxTokenLimit          = site - 0x3c
-    #   proto.Equal result            = site
-    #   CheckpointConfig write        = site + 0x20
-    #   function return point         = site + 0x52
+    # Locate the acp-override and model-gate sites symbolically so the
+    # breakpoints work across 1.5.7..1.5.14+ regardless of stack-slot shifts.
     try:
         u = unlock.Unlocker(binary)
         gate = next(p for p in unlock.PATCHES if p.key == "model-gate")
         _gate_off, gate_va = u.locate_patch(gate)
+        acp_patch = next(p for p in unlock.PATCHES if p.key == "acp-override")
+        acp_state, _acp_off, acp_va, _acp_new = u.inspect_patch(acp_patch)
+        bc_fn = u.symbols.find(gate.symbol)
+        bc_start, bc_end = u.func_bytes(bc_fn)
+        bc_blob = bytes(u.data[bc_start:bc_end])
+        gate_rel = gate_va - bc_fn.va
+        write_rel = bc_blob.find(b"\x89\x48\x0c", gate_rel)  # mov %ecx, 0xc(%rax)
+        ret_rel = bc_blob.find(b"\x48\x89\xc8\xc9", gate_rel)  # mov %rcx, %rax; leave
+        if write_rel < 0 or ret_rel < 0:
+            raise unlock.BinaryError("cannot locate write/return instructions in buildCascadeConfigInternal")
     except Exception as exc:  # BinaryError, OSError, StopIteration
-        print(f"error: cannot locate model-gate in {binary}: {exc}", file=sys.stderr)
+        print(f"error: cannot locate breakpoints in {binary}: {exc}", file=sys.stderr)
         return 2
     offsets = {
-        "GDB_VERIFY_OFF_STRING_LEN": gate_va - 0x41,
-        "GDB_VERIFY_OFF_LIMIT": gate_va - 0x3c,
+        "GDB_VERIFY_OFF_STRING_LEN": acp_va,
+        "GDB_VERIFY_OFF_LIMIT": acp_va + (15 if acp_state == "patched" else 5),
         "GDB_VERIFY_OFF_PROTO": gate_va,
-        "GDB_VERIFY_OFF_WRITE": gate_va + 0x20,
-        "GDB_VERIFY_OFF_RETURN": gate_va + 0x52,
+        "GDB_VERIFY_OFF_WRITE": bc_fn.va + write_rel,
+        "GDB_VERIFY_OFF_RETURN": bc_fn.va + ret_rel,
     }
 
     models = [m.strip() for m in args.models.split(",") if m.strip()]
@@ -143,6 +149,7 @@ def main() -> int:
         for model in models:
             out_path = Path(work) / "result.json"
             env = dict(os.environ)
+            env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "1"
             if args.override:
                 env["AGY_CLI_AUTO_COMPACT_OVERRIDE"] = str(args.override)
             else:

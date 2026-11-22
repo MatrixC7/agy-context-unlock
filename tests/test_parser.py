@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline tests for the ELF/pclntab parser and the three patch sites.
+"""Offline tests for the ELF/pclntab parser and the five core patch sites.
 
 Run:  python3 -m unittest discover -s tests -v
 They are skipped automatically when /usr/bin/agy is absent or is not the
@@ -51,6 +51,8 @@ class TestTargetBinary(unittest.TestCase):
             "model.SelectorModel.offersContextWindow": 0xA6A03C0,
             "store.(*Store).ContextWindowChoice": 0xA3FDEA0,
             "store.(*Store).ContextWindow": 0xA3FDEE0,
+            "store.AutoCompactOverrideSpec": 0xA3FDC00,
+            "backend.ContextWindow.MaxTokenLimit": 0xA0789E0,
             "backend.(*ServerBackend).buildCascadeConfigInternal": 0xA08C3A0,
             "utils.GetCheckpointConfig": 0x84F5CE0,
         }
@@ -62,8 +64,12 @@ class TestTargetBinary(unittest.TestCase):
         u = unlock.Unlocker(BIN)
         before = bytes(u.data)
         for p in [x for x in unlock.PATCHES if not x.optional]:
-            off, _va = u.locate_patch(p)
-            self.assertEqual(before[off:off + len(p.old)], p.old, p.key)
+            state, off, _va, _new = u.inspect_patch(p)
+            self.assertEqual(state, "clean", p.key)
+            if p.key == "acp-override":
+                self.assertEqual(before[off + 5:off + 5 + len(p.old)], p.old, p.key)
+            else:
+                self.assertEqual(before[off:off + len(p.old)], p.old, p.key)
 
     def test_patch_changes_only_expected_bytes(self):
         u = unlock.Unlocker(BIN)
@@ -73,18 +79,19 @@ class TestTargetBinary(unittest.TestCase):
         after = bytes(u.data)
         diff = {i for i in range(len(before)) if before[i] != after[i]}
         expected = set()
-        # exact expected diff: derive from the four known core patch sites (20 bytes total)
+        # exact expected diff: derive from the five known core patch sites (42 bytes total)
         sites = {
             "ui-selector": (0xA6A03C0, range(0, 6)),
             "store-gate": (0xA3FDFA9, (1, 3, 4, 5, 6)),
             "settings-window": (0xA3FE005, (2, 8, 9, 10, 11, 12, 13, 14)),
             "model-gate": (0xA08D0CB, (0,)),
+            "acp-override": (0xA08D088, range(0, 22)),
         }
         for name, (base, rels) in sites.items():
             for r in rels:
                 expected.add(base + r)
         self.assertEqual(diff, expected)
-        self.assertEqual(len(diff), 20)
+        self.assertEqual(len(diff), 42)
 
     def test_cli_locate_json(self):
         r = subprocess.run(

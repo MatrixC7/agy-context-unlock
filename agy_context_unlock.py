@@ -14,8 +14,8 @@ Verified mechanism (antigravity-cli 1.5.7, Linux x86-64)
    ``AGY_CLI_AUTO_COMPACT_OVERRIDE`` only works for ``"Gemini 4 Argon"`` due to
    a hardcoded one-model whitelist in ``store.(*Store).ContextWindow``.
 
-What the four core binary patches do (20 bytes total)
------------------------------------------------------
+What the five core binary patches do (39-42 bytes total; 42 on 1.5.7)
+---------------------------------------------------------------------
 1. ``ui-selector`` (``model.SelectorModel.offersContextWindow``, 6 bytes):
    Forces ``offersContextWindow()`` to return ``true`` so the Context selector
    (256K / 512K / 900K) is visible in ``/model`` for every model.
@@ -36,8 +36,18 @@ What the four core binary patches do (20 bytes total)
    Changes the ``proto.Equal`` conditional jump (``jne`` -> ``jmp``) so any
    non-zero resolved context window is unconditionally written into
    ``CheckpointConfig.MaxTokenLimit`` (offset ``+0xc``, protobuf field 5).
+5. ``acp-override`` (``backend.(*ServerBackend).buildCascadeConfigInternal``, 19-22 bytes):
+   In headless ACP mode (``agy acp``, e.g. T3 Code), ``store.Manager`` is never
+   created and ``ServerBackend.SetContextWindow`` is never called, so
+   ``ServerBackend.ContextWindow()`` always returns ``""``.  When that return
+   value is empty, this patch falls back to ``store.AutoCompactOverrideSpec()``
+   (``strings.TrimSpace(os.Getenv("AGY_CLI_AUTO_COMPACT_OVERRIDE"))``) before
+   calling ``backend.ContextWindow.MaxTokenLimit()`` (accepting both ``"900K"``
+   and ``"900000"``).  Interactive TUI behavior is unchanged whenever
+   ``ServerBackend.ContextWindow()`` is non-empty, and when the env var is unset
+   it falls back cleanly to the original empty/default path.
 
-An optional 5th patch (``default-clamp``, enabled via ``--with-default-clamp``)
+An optional 6th patch (``default-clamp``, enabled via ``--with-default-clamp``)
 raises the fallback ``min(x, 256000)`` cap in ``utils.GetCheckpointConfig`` to
 ``1048576``.
 """
@@ -57,7 +67,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-PROJECT_VERSION = "2.1.0"
+PROJECT_VERSION = "2.2.0"
 TARGET_VERSION = "1.5.7"
 TARGET_SHA256_PREFIX = "5df525a2d6908989"
 GO_MAGICS = (0xFFFFFFF1, 0xFFFFFFF0)  # Go 1.18+ primary layout; 0xFFFFFFF0 kept as constant
@@ -394,9 +404,22 @@ PATCHES: List[Patch] = [
     Patch(
         key="model-gate",
         symbol="backend.(*ServerBackend).buildCascadeConfigInternal",
-        old=bytes.fromhex("84 c0 75 0a 48 8b 8c 24 b0 00 00 00"),
-        new=bytes.fromhex("84 c0 eb 0a 48 8b 8c 24 b0 00 00 00"),
+        # Symbolic anchor: `call proto.Equal` followed by `test %al,%al; jne <exit_stub>`.
+        old=bytes.fromhex("84 c0 75 0a"),
+        new=bytes.fromhex("84 c0 eb 0a"),
         description="Checkpoint override: drop the selected-model equality gate",
+    ),
+    Patch(
+        key="acp-override",
+        symbol="backend.(*ServerBackend).buildCascadeConfigInternal",
+        # Symbolic anchor: `call ServerBackend.ContextWindow` followed by
+        # `call MaxTokenLimit; test %eax,%eax; jne <exit_stub>; <exit_stub>` (19..22B).
+        old=bytes.fromhex("85 c0 75"),
+        # Prefix of the dynamically resolved 19..22-byte ACP env fallback sequence:
+        #   test %rbx,%rbx; jne +5; call AutoCompactOverrideSpec; call MaxTokenLimit;
+        #   test %eax,%eax; je <exit_stub>; [nop...]
+        new=bytes.fromhex("48 85 db 75 05"),
+        description="ACP fallback: read AGY_CLI_AUTO_COMPACT_OVERRIDE when ServerBackend.ContextWindow() is empty",
     ),
     Patch(
         key="default-clamp",
@@ -430,16 +453,93 @@ class Unlocker:
         if self.text_sec is None:
             raise BinaryError(".text section not found")
 
+    @staticmethod
+    def _validate_exit_stub(blob: bytes, idx: int, label: str) -> int:
+        """Validate `mov disp(%rsp), %rcx; jmp ret` at blob[idx:] and return its byte length."""
+        if idx + 7 > len(blob):
+            raise BinaryError(f"{label}: truncated exit stub")
+        if blob[idx:idx + 4] == b"\x48\x8b\x8c\x24":  # mov disp32(%rsp), %rcx
+            mov_len = 8
+        elif blob[idx:idx + 4] == b"\x48\x8b\x4c\x24":  # mov disp8(%rsp), %rcx
+            mov_len = 5
+        else:
+            raise BinaryError(f"{label}: unexpected mov instruction in exit stub ({blob[idx:idx + 4].hex()})")
+        jmp_off = idx + mov_len
+        if jmp_off + 2 > len(blob):
+            raise BinaryError(f"{label}: truncated jmp in exit stub")
+        if blob[jmp_off] == 0xEB:  # jmp rel8
+            jmp_len = 2
+        elif blob[jmp_off] == 0xE9 and jmp_off + 5 <= len(blob):  # jmp rel32
+            jmp_len = 5
+        else:
+            raise BinaryError(f"{label}: unexpected jmp opcode in exit stub ({blob[jmp_off]:#x})")
+        return mov_len + jmp_len
+
+    def _find_unique_call(self, fn: GoFunc, blob: bytes, target_sym: str, label: str) -> int:
+        """Return the unique byte offset within ``blob`` of a `call rel32` to ``target_sym``."""
+        target = self.symbols.find(target_sym)
+        hits = []
+        pos = 0
+        while True:
+            i = blob.find(b"\xe8", pos)
+            if i < 0 or i + 5 > len(blob):
+                break
+            pos = i + 1
+            rel = struct.unpack_from("<i", blob, i + 1)[0]
+            if fn.va + i + 5 + rel == target.va:
+                hits.append(i)
+        if len(hits) != 1:
+            raise BinaryError(f"{label}: expected 1 call to {target_sym} in {fn.name}, found {len(hits)}")
+        return hits[0]
+
+    def _inspect_model_gate(self, fn: GoFunc, start: int, blob: bytes) -> Tuple[str, int, int, bytes]:
+        """Locate `call proto.Equal; test %al,%al; (jne|jmp) <exit_stub>` symbolically."""
+        peq_idx = self._find_unique_call(fn, blob, "proto.Equal", "model-gate")
+        site_idx = peq_idx + 5
+        if site_idx + 4 > len(blob) or blob[site_idx:site_idx + 2] != b"\x84\xc0":
+            raise BinaryError(f"model-gate: expected `test %al,%al` after call proto.Equal in {fn.name}")
+        op = blob[site_idx + 2]
+        if op not in (0x75, 0xEB):
+            raise BinaryError(f"model-gate: expected jne/jmp after `test %al,%al` (got {op:#x})")
+        j_disp = blob[site_idx + 3]
+        stub_len = self._validate_exit_stub(blob, site_idx + 4, "model-gate")
+        if j_disp != stub_len:
+            raise BinaryError(f"model-gate: jump displacement {j_disp:#x} != exit stub length {stub_len:#x}")
+        state = "patched" if op == 0xEB else "clean"
+        return state, start + site_idx, fn.va + site_idx, bytes([0x84, 0xC0, 0xEB, j_disp])
+
+    def _build_acp_core(self, site_va: int, exit_stub_va: int) -> bytes:
+        acos_fn = self.symbols.find("store.AutoCompactOverrideSpec")
+        mtl_fn = self.symbols.find("backend.ContextWindow.MaxTokenLimit")
+        rel_acos = acos_fn.va - (site_va + 10)  # +5B test/jne + 5B call
+        rel_mtl = mtl_fn.va - (site_va + 15)    # +10B + 5B call
+        rel8_exit = exit_stub_va - (site_va + 19)  # +15B + 2B test + 2B je
+        if not (-1 << 31 <= rel_acos < 1 << 31):
+            raise BinaryError(f"acp-override: AutoCompactOverrideSpec out of rel32 range ({rel_acos:#x})")
+        if not (-1 << 31 <= rel_mtl < 1 << 31):
+            raise BinaryError(f"acp-override: MaxTokenLimit out of rel32 range ({rel_mtl:#x})")
+        if not (-128 <= rel8_exit <= 127):
+            raise BinaryError(f"acp-override: exit stub out of rel8 range ({rel8_exit:#x})")
+        return (
+            bytes.fromhex("48 85 db 75 05")
+            + b"\xe8" + struct.pack("<i", rel_acos)
+            + b"\xe8" + struct.pack("<i", rel_mtl)
+            + bytes.fromhex("85 c0 74") + struct.pack("<b", rel8_exit)
+        )
+
     def _resolve_patch_new_bytes(self, p: Patch, site_va: int) -> bytes:
-        """For settings-window, dynamically verify/compute the relative call to ContextWindowChoice."""
-        if p.key != "settings-window":
-            return p.new
-        choice_fn = self.symbols.find("store.(*Store).ContextWindowChoice")
-        call_next_va = site_va + 8 + 5  # mov (8B) + call rel32 (5B)
-        rel = choice_fn.va - call_next_va
-        if not (-1 << 31 <= rel < 1 << 31):
-            raise BinaryError(f"settings-window: ContextWindowChoice out of rel32 range ({rel:#x})")
-        return bytes.fromhex("48 8b 84 24 08 01 00 00") + b"\xe8" + struct.pack("<i", rel) + b"\xc9\xc3"
+        """Compute dynamic target-relative machine code for call/branch patches."""
+        if p.key == "settings-window":
+            choice_fn = self.symbols.find("store.(*Store).ContextWindowChoice")
+            call_next_va = site_va + 8 + 5  # mov (8B) + call rel32 (5B)
+            rel = choice_fn.va - call_next_va
+            if not (-1 << 31 <= rel < 1 << 31):
+                raise BinaryError(f"settings-window: ContextWindowChoice out of rel32 range ({rel:#x})")
+            return bytes.fromhex("48 8b 84 24 08 01 00 00") + b"\xe8" + struct.pack("<i", rel) + b"\xc9\xc3"
+        if p.key in ("model-gate", "acp-override"):
+            _state, _off, _va, new_bytes = self.inspect_patch(p)
+            return new_bytes
+        return p.new
 
     # -- helpers -----------------------------------------------------------
     def func_bytes(self, fn: GoFunc) -> Tuple[int, int]:
@@ -451,49 +551,97 @@ class Unlocker:
             end = min(len(self.data), start + 0x4000)
         return start, end
 
-    def is_patched(self) -> bool:
-        for p in [x for x in PATCHES if not x.optional]:
-            fn = self.symbols.find(p.symbol)
-            start, end = self.func_bytes(fn)
-            if p.new not in bytes(self.data[start:end]):
-                return False
-        return True
-
-    def locate_patch(self, p: Patch) -> Tuple[int, int]:
+    def inspect_patch(self, p: Patch) -> Tuple[str, int, int, bytes]:
+        """Return (state, file_offset, va, resolved_new_bytes) with state in {'patched', 'clean'}."""
         fn = self.symbols.find(p.symbol)
         start, end = self.func_bytes(fn)
         blob = bytes(self.data[start:end])
-        hits = []
-        pos = 0
-        while True:
-            i = blob.find(p.old, pos)
-            if i < 0:
-                break
-            hits.append(i)
-            pos = i + 1
-        if p.new in blob:
-            idx = blob.find(p.new)
-            return start + idx, fn.va + idx
-        if p.occurrence == 0:
-            if len(hits) != 1:
+
+        if p.key == "model-gate":
+            return self._inspect_model_gate(fn, start, blob)
+
+        if p.key == "acp-override":
+            cw_idx = self._find_unique_call(fn, blob, "backend.(*ServerBackend).ContextWindow", "acp-override")
+            site_idx = cw_idx + 5
+            site_va = fn.va + site_idx
+            _mg_state, _mg_off, mg_va, _mg_new = self._inspect_model_gate(fn, start, blob)
+            exit_stub_va = mg_va + 4
+            core = self._build_acp_core(site_va, exit_stub_va)
+
+            if site_idx + 19 <= len(blob) and blob[site_idx:site_idx + 19] == core:
+                pad = 0
+                while pad <= 8 and site_idx + 19 + pad < len(blob) and blob[site_idx + 19 + pad] == 0x90:
+                    pad += 1
+                if blob[site_idx + 19 + pad:site_idx + 19 + pad + 3] != b"\x89\x44\x24":
+                    raise BinaryError(f"acp-override: patched sequence not followed by mov %eax, disp(%rsp)")
+                return "patched", start + site_idx, site_va, core + b"\x90" * pad
+
+            mtl_fn = self.symbols.find("backend.ContextWindow.MaxTokenLimit")
+            expected_call = b"\xe8" + struct.pack("<i", mtl_fn.va - (site_va + 5))
+            if blob[site_idx:site_idx + 5] != expected_call:
                 raise BinaryError(
-                    f"{p.key}: expected exactly one match of {p.old.hex()} in "
-                    f"{p.symbol}, found {len(hits)}"
+                    f"acp-override: expected call MaxTokenLimit after ContextWindow "
+                    f"(got {blob[site_idx:site_idx + 5].hex()}, want {expected_call.hex()})"
                 )
-            i = hits[0]
-        else:
-            if len(hits) <= p.occurrence:
+            if blob[site_idx + 5:site_idx + 8] != b"\x85\xc0\x75":
+                raise BinaryError(f"acp-override: expected `test %eax,%eax; jne` after MaxTokenLimit")
+            skip_len = blob[site_idx + 8]
+            stub_len = self._validate_exit_stub(blob, site_idx + 9, "acp-override")
+            if skip_len != stub_len:
+                raise BinaryError(f"acp-override: jne displacement {skip_len:#x} != exit stub length {stub_len:#x}")
+            slot_len = 9 + skip_len
+            if slot_len < len(core):
+                raise BinaryError(f"acp-override: slot too small ({slot_len}B < {len(core)}B)")
+            if blob[site_idx + slot_len:site_idx + slot_len + 3] != b"\x89\x44\x24":
+                raise BinaryError(f"acp-override: slot not followed by mov %eax, disp(%rsp)")
+            new_bytes = core + b"\x90" * (slot_len - len(core))
+            return "clean", start + site_idx, site_va, new_bytes
+
+        if p.key == "settings-window":
+            prefix = bytes.fromhex("48 8b 84 24 08 01 00 00 e8")
+            patched_hits = []
+            pos = 0
+            while True:
+                i = blob.find(prefix, pos)
+                if i < 0:
+                    break
+                pos = i + 1
+                if i + 15 <= len(blob):
+                    cand = self._resolve_patch_new_bytes(p, fn.va + i)
+                    if blob[i:i + 15] == cand:
+                        patched_hits.append((i, cand))
+            if len(patched_hits) == 1:
+                i, cand = patched_hits[0]
+                return "patched", start + i, fn.va + i, cand
+            if len(patched_hits) > 1:
+                raise BinaryError(f"{p.key}: multiple patched sites found in {p.symbol}")
+
+            hits = []
+            pos = 0
+            while True:
+                i = blob.find(p.old, pos)
+                if i < 0:
+                    break
+                hits.append(i)
+                pos = i + 1
+            if not hits:
+                raise BinaryError(f"{p.key}: expected bytes not found in {p.symbol}")
+            if p.occurrence == 0 and len(hits) != 1:
+                raise BinaryError(
+                    f"{p.key}: expected exactly one match of {p.old.hex()} in {p.symbol}, found {len(hits)}"
+                )
+            if p.occurrence >= len(hits):
                 raise BinaryError(f"{p.key}: occurrence {p.occurrence} not found in {p.symbol}")
             i = hits[p.occurrence]
-        return start + i, fn.va + i
+            site_va = fn.va + i
+            new_bytes = self._resolve_patch_new_bytes(p, site_va)
+            if i + len(new_bytes) > len(blob):
+                raise BinaryError(f"{p.key}: replacement exceeds function bounds in {p.symbol}")
+            return "clean", start + i, site_va, new_bytes
 
-    def apply(self, p: Patch) -> PatchResult:
-        fn = self.symbols.find(p.symbol)
-        start, end = self.func_bytes(fn)
-        blob = bytes(self.data[start:end])
         if p.new in blob:
-            off = start + blob.find(p.new)
-            return PatchResult(p, "already", fn.va + blob.find(p.new), off, "already patched")
+            idx = blob.find(p.new)
+            return "patched", start + idx, fn.va + idx, p.new
         hits = []
         pos = 0
         while True:
@@ -505,14 +653,34 @@ class Unlocker:
         if not hits:
             raise BinaryError(f"{p.key}: expected bytes not found in {p.symbol}")
         if p.occurrence == 0 and len(hits) != 1:
-            raise BinaryError(f"{p.key}: expected one match in {p.symbol}, found {len(hits)}")
+            raise BinaryError(
+                f"{p.key}: expected exactly one match of {p.old.hex()} in {p.symbol}, found {len(hits)}"
+            )
         if p.occurrence >= len(hits):
-            raise BinaryError(f"{p.key}: occurrence {p.occurrence} missing in {p.symbol}")
+            raise BinaryError(f"{p.key}: occurrence {p.occurrence} not found in {p.symbol}")
         i = hits[p.occurrence]
-        site_va = fn.va + i
-        new_bytes = self._resolve_patch_new_bytes(p, site_va)
-        self.data[start + i:start + i + len(new_bytes)] = new_bytes
-        return PatchResult(p, "applied", site_va, start + i, p.description)
+        return "clean", start + i, fn.va + i, p.new
+
+    def is_patched(self) -> bool:
+        for p in [x for x in PATCHES if not x.optional]:
+            try:
+                state, _off, _va, _new = self.inspect_patch(p)
+            except BinaryError:
+                return False
+            if state != "patched":
+                return False
+        return True
+
+    def locate_patch(self, p: Patch) -> Tuple[int, int]:
+        _state, off, va, _new = self.inspect_patch(p)
+        return off, va
+
+    def apply(self, p: Patch) -> PatchResult:
+        state, off, site_va, new_bytes = self.inspect_patch(p)
+        if state == "patched":
+            return PatchResult(p, "already", site_va, off, "already patched")
+        self.data[off:off + len(new_bytes)] = new_bytes
+        return PatchResult(p, "applied", site_va, off, p.description)
 
 
 # ---------------------------------------------------------------------------
@@ -541,9 +709,9 @@ def cmd_locate(args: argparse.Namespace) -> int:
     print("\n[patch targets]")
     for p in PATCHES:
         try:
-            off, va = u.locate_patch(p)
+            state_key, off, va, _new = u.inspect_patch(p)
             fn = u.symbols.find(p.symbol)
-            state = "already patched" if p.new in bytes(u.data[off:off + len(p.new)]) else "patchable"
+            state = "already patched" if state_key == "patched" else "patchable"
             print(f"  {p.key:16s} {state:15s} {p.symbol} +0x{va - fn.va:x} (va {va:#x}, off {off:#x})")
         except BinaryError as exc:
             print(f"  {p.key:16s} NOT FOUND      {exc}")
@@ -586,6 +754,14 @@ def cmd_patch(args: argparse.Namespace) -> int:
             return 2
         selected = [p for p in PATCHES if p.key in wanted]
 
+    prior_patched_keys: List[str] = []
+    for p in PATCHES:
+        try:
+            if u.inspect_patch(p)[0] == "patched":
+                prior_patched_keys.append(p.key)
+        except BinaryError:
+            pass
+
     results: List[PatchResult] = []
     print("\n[applying]")
     for p in selected:
@@ -622,11 +798,43 @@ def cmd_patch(args: argparse.Namespace) -> int:
         print("error: refusing to overwrite a system binary; pass --allow-system or use install mode", file=sys.stderr)
         return 2
     if overwrites_source:
-        _ensure_backup(src, u.sha256)
+        if _backup_matches_clean_source(src, u.sha256, prior_patched_keys):
+            backup = src.with_name(src.name + ".agy-unlock-backup")
+            print(f"[i] keeping existing clean backup: {backup}")
+        else:
+            _ensure_backup(src, u.sha256)
     _atomic_write(dst, bytes(u.data), src.stat().st_mode)
     print(f"[*] wrote {dst}")
     print(f"    sha256 {u.sha256} -> {hashlib.sha256(u.data).hexdigest()}")
     return 0
+
+
+def _backup_matches_clean_source(src: Path, source_sha: str, already_keys: List[str]) -> bool:
+    """Return True if existing .agy-unlock-backup is provably the clean original of src.
+
+    When upgrading agy-context-unlock itself (e.g. adding a new patch onto an
+    already-patched binary), overwriting/rotating .agy-unlock-backup with the
+    partially patched binary would lose the clean unpatched backup.  Verify
+    cryptographically by re-applying the already-present patches onto the backup
+    in memory and checking that the result matches ``source_sha``.
+    """
+    if not already_keys:
+        return False
+    backup = src.with_name(src.name + ".agy-unlock-backup")
+    if not backup.exists():
+        return False
+    try:
+        if backup.stat().st_size != src.stat().st_size:
+            return False
+        bu = Unlocker(backup)
+        by_key = {p.key: p for p in PATCHES}
+        for key in already_keys:
+            r = bu.apply(by_key[key])
+            if r.status != "applied":
+                return False
+        return hashlib.sha256(bu.data).hexdigest() == source_sha
+    except (BinaryError, OSError):
+        return False
 
 
 
@@ -670,34 +878,42 @@ def _atomic_write(path: Path, data: bytes, mode: int) -> None:
 
 
 def _verify_patched(data: bytes) -> Tuple[bool, List[str]]:
-    elf = ELFFile(data)
-    syms = GoSymbols(elf)
+    u = object.__new__(Unlocker)
+    u.path = Path("<memory>")
+    u.data = bytearray(data)
+    u.sha256 = hashlib.sha256(data).hexdigest()
+    u.is_target = u.sha256.startswith(TARGET_SHA256_PREFIX)
+    u.elf = ELFFile(data)
+    u.symbols = GoSymbols(u.elf)
+    u.text_sec = u.elf.section(".text")
     problems = []
     for p in PATCHES:
         if p.optional:
             continue
-        fn = syms.find(p.symbol)
-        start = elf.va_to_off(fn.va)
-        end = elf.va_to_off(fn.end) or start + 0x4000
-        if p.new not in data[start:end]:
+        try:
+            state, _off, _va, _new = u.inspect_patch(p)
+        except BinaryError as exc:
+            problems.append(f"{p.key}: {exc}")
+            continue
+        if state != "patched":
             problems.append(f"{p.key}: patched bytes absent")
     return not problems, problems
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
     path = Path(args.binary).expanduser().resolve()
-    data = path.read_bytes()
-    elf = ELFFile(data)
-    syms = GoSymbols(elf)
-    print(f"[i] {path}\n[i] sha256 {hashlib.sha256(data).hexdigest()}")
-    print(f"[i] go text_base={syms.text_base:#x} nfunc={syms.nfunc}")
+    u = Unlocker(path)
+    print(f"[i] {path}\n[i] sha256 {u.sha256}")
+    print(f"[i] go text_base={u.symbols.text_base:#x} nfunc={u.symbols.nfunc}")
     ok = True
     for p in PATCHES:
-        fn = syms.find(p.symbol)
-        start = elf.va_to_off(fn.va)
-        end = elf.va_to_off(fn.end) or start + 0x4000
-        applied = p.new in data[start:end]
-        status = "PATCHED" if applied else ("clean" if p.old in data[start:end] else "UNKNOWN")
+        try:
+            state_key, _off, _va, _new = u.inspect_patch(p)
+            applied = state_key == "patched"
+            status = "PATCHED" if applied else "clean"
+        except BinaryError:
+            applied = False
+            status = "UNKNOWN"
         print(f"  {p.key:16s} {status:8s} {p.symbol}")
         if not p.optional and not applied:
             ok = False
@@ -727,6 +943,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         "model.SelectorModel.offersContextWindow": 0xA6A03C0,
         "store.(*Store).ContextWindowChoice": 0xA3FDEA0,
         "store.(*Store).ContextWindow": 0xA3FDEE0,
+        "store.AutoCompactOverrideSpec": 0xA3FDC00,
+        "backend.ContextWindow.MaxTokenLimit": 0xA0789E0,
         "backend.(*ServerBackend).buildCascadeConfigInternal": 0xA08C3A0,
         "utils.GetCheckpointConfig": 0x84F5CE0,
     }
@@ -740,12 +958,12 @@ def cmd_self_test(args: argparse.Namespace) -> int:
 
     # Count the bytes that each patch would actually change.  We cannot zip
     # p.old/p.new: settings-window matches 14 bytes but writes 15 (the trailing
-    # "ret" replaces the byte after the old signature).
+    # "ret" replaces the byte after the old signature), and acp-override
+    # resolves dynamic call/jump displacements over 22 bytes.
     base = bytearray(before)
     expected = 0
     for p in required:
-        off, site_va = u.locate_patch(p)
-        new_bytes = u._resolve_patch_new_bytes(p, site_va)
+        _state, off, _site_va, new_bytes = u.inspect_patch(p)
         expected += sum(1 for i, b in enumerate(new_bytes) if base[off + i] != b)
 
     for p in required:
@@ -1000,7 +1218,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="confirm --in-place")
     p.add_argument("--allow-system", action="store_true", help="allow --in-place on /usr/bin/agy")
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--patches", help="comma-separated subset: ui-selector,store-gate,settings-window,model-gate,default-clamp")
+    p.add_argument("--patches", help="comma-separated subset: ui-selector,store-gate,settings-window,model-gate,acp-override,default-clamp")
     p.add_argument("--with-default-clamp", action="store_true", help="also raise the local 256000 fallback cap to 1048576")
     p.add_argument("--allow-unknown", action="store_true", help="allow a binary whose SHA256 is not the verified 1.5.7 build")
     p.set_defaults(func=cmd_patch)

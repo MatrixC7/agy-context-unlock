@@ -1,27 +1,27 @@
 # agy-context-unlock
 
-面向 **`antigravity-cli`（命令行工具 `/usr/bin/agy`，Linux x86-64）** 的零依赖本地上下文预算解锁工具：解除 `256K` 本地自动压缩限制，恢复 `/model` 交互菜单 `[Tab] Context` 档位切换与 `settings.json` 持久化闭环，同时支持 Google OAuth 原生通道与企业网关自定义模型。
+面向 **`antigravity-cli`（命令行工具 `/usr/bin/agy`，Linux x86-64）** 的零依赖本地上下文预算解锁工具：解除 `256K` 本地自动压缩限制，恢复 `/model` 交互菜单 `[Tab] Context` 档位切换与 `settings.json` 持久化闭环，并打通 `agy acp` 无头模式（如 T3 Code）的环境变量覆盖，同时支持 Google OAuth 原生通道与企业网关自定义模型。
 
 ---
 
 ## 核心特性
 
-- **恢复 `/model` 与 `settings.json` 原生持久化闭环**：按 Go 符号名动态定位目标函数，精确修改 **4 处共 20 字节**（`ui-selector`、`store-gate`、`settings-window`、`model-gate`），恢复所有模型的 `[Tab] Context (256K / 512K / 900K)` 切换器与 `settings.json` 自动读取；日常使用无需包装启动器或每次传入环境变量（同时保留 `AGY_CLI_AUTO_COMPACT_OVERRIDE` 作为最高优先级临时覆盖）。
+- **恢复 `/model` 与 `settings.json` 原生持久化闭环 + 打通 ACP 宿主环境变量覆盖**：按 Go 符号名动态定位目标函数，精确修改 **5 处核心位点（`1.5.7` 锚点共 42 字节，`1.5.14+` 缩为 39 字节）**（`ui-selector`、`store-gate`、`settings-window`、`model-gate`、`acp-override`），恢复所有模型的 `[Tab] Context (256K / 512K / 900K)` 切换器与 `settings.json` 自动读取；同时让 `agy acp` 无头模式（如 T3 Code）在提供方环境变量中配置 `AGY_CLI_AUTO_COMPACT_OVERRIDE=900K`（或 `900000`）时直接生效。日常使用无需包装启动器（同时保留 `AGY_CLI_AUTO_COMPACT_OVERRIDE` 作为最高优先级临时覆盖）。
 - **按模型家族自动遵循物理安全上界**：选择 `"900K"` 档位后，引擎仍会自动执行 `min(设定值, MaxTokens - MaxOutputTokens)` 保护输出预留：
   - `Gemini 4 Argon` / `Gemini 3.8 Flash`：**`900,000`**（物理上界 `983,040`，可经环境变量进一步释放）。
   - `Claude Opus 5.5` / `Claude Sonnet 5.5`：自动钳位至 **`872,000`**（`1,000,000 - 128,000`）。
   - `Gemini 4 Carbon`：自动钳位至 **`786,432`**（`1,048,576 - 262,144`）。
   - 企业网关自定义模型（Gemini / DeepSeek 等）：放行白名单门禁，直接支持 `settings.json` 或环境变量设定上限。
-- **故障闭合、原子写入与旧备份轮换**：内置纯 Python 标准库 ELF64 + Go 1.18+ `pclntab` 解析器，先在内存中匹配并预演全部必选补丁，任一失败即中止且不写盘；跨软件包升级原地修补时自动将旧备份轮换为 `.agy-unlock-backup.<旧SHA前8位>`，防止 `restore` 误降级。
+- **故障闭合、原子写入与备份安全机制**：内置纯 Python 标准库 ELF64 + Go 1.18+ `pclntab` 解析器，先在内存中匹配并预演全部必选补丁，任一失败即中止且不写盘；跨软件包升级原地修补时自动将旧备份轮换为 `.agy-unlock-backup.<旧SHA前8位>`，防止 `restore` 误降级；而在已修补的同一版本上增量叠加新补丁时，通过内存重放哈希校验原地保留原有的干净原版备份。
 - **零外部依赖，职责独立**：仅需 Python 3 标准库；针对命令行版 `/usr/bin/agy`，与桌面端工具及多账号切号工具职责正交、互不冲突。
 
 ---
 
 ## 版本要求与兼容性
 
-- **当前 `main` 分支适用范围**：`antigravity-cli >= 1.5.7`（Linux x86-64；以 `1.5.7` 为锚点验证，后续结构体未发生冲突变动的兼容版本如 `1.5.12` 可配合 `--allow-unknown` 直接动态定位并修补）。
+- **当前 `main` 分支适用范围**：`antigravity-cli >= 1.5.7`（Linux x86-64；以 `1.5.7` 为锚点验证，后续兼容版本如 `1.5.12`–`1.5.14` 可配合 `--allow-unknown` 直接动态定位并修补；`model-gate` 与 `acp-override` 采用调用指令符号锚定，可跨栈槽与跳转宽度变动自动适配）。
 - **历史版本归档**：仓库标签 **`v1.5.5`** 保存了 `1.5.7` 之前的补丁线（适用于 `1.5.1`–`1.5.5`）。旧版环境请先执行 `git checkout v1.5.5`。
-- **实机兼容性判定**：可先运行只读 `locate --binary /usr/bin/agy` 确认 4 处必选补丁均显示 `patchable` 或 `already patched`；若未来上游改动结构体偏移导致签名失配，脚本将以退出码 `3` 安全中止，不写入任何字节。
+- **实机兼容性判定**：可先运行只读 `locate --binary /usr/bin/agy` 确认 5 处必选补丁均显示 `patchable` 或 `already patched`；若未来上游改动结构体偏移导致签名失配，脚本将以退出码 `3` 安全中止，不写入任何字节。
 - **适用对象与运行环境**：仅面向命令行工具 `/usr/bin/agy`（**非** Antigravity 桌面端 IDE）；仅需 Python 3 标准库，零第三方依赖。
 
 ---
@@ -32,19 +32,21 @@
 git clone https://github.com/MatrixC7/agy-context-unlock.git ~/agy-context-unlock
 cd ~/agy-context-unlock
 
-# 1. 只读检查目标函数与 4 处补丁位点（不修改任何文件）
+# 1. 只读检查目标函数与 5 处必选（共 6 处）补丁位点（不修改任何文件）
 python3 agy_context_unlock.py locate --binary /usr/bin/agy
 
 # 2. 原地修补 /usr/bin/agy（自动创建原版备份；1.5.7 之后的兼容版本需保留 --allow-unknown）
 sudo python3 ~/agy-context-unlock/agy_context_unlock.py patch \
   --binary /usr/bin/agy --in-place --yes --allow-system --allow-unknown
 
-# 3. 校验 4 处必选补丁状态（确认输出 verified: required patches are present）
+# 3. 校验 5 处必选补丁状态（确认输出 verified: required patches are present）
 python3 ~/agy-context-unlock/agy_context_unlock.py verify --binary /usr/bin/agy
 ```
 
 > [!IMPORTANT]
-> **修补完成后启用高预算窗口**：启动 `agy` 后输入 `/model`，按 `Tab` 键将 `Context` 切至 `900K`（或 `512K`）并按 `Enter` 确认，即可自动写入 `~/.gemini/antigravity-cli/settings.json` 并持久生效；亦可直接在该配置文件中设置 `"contextWindow": "900K"`。
+> **修补完成后启用高预算窗口**：
+> - **交互式 CLI（`agy`）**：启动 `agy` 后输入 `/model`，按 `Tab` 键将 `Context` 切至 `900K`（或 `512K`）并按 `Enter` 确认，即可自动写入 `~/.gemini/antigravity-cli/settings.json` 并持久生效；亦可直接在该配置文件中设置 `"contextWindow": "900K"`。
+> - **ACP 无头模式（如 T3 Code）**：`agy acp` 不读取交互式 `settings.json`，在宿主对应提供方环境变量（例如 T3 Code 的「设置 → 智能体提供方 → Antigravity → 环境 → 变量」）中添加 `AGY_CLI_AUTO_COMPACT_OVERRIDE=900K`（或 `900000`，注意 `K` 须大写）后**新开会话**（或重启宿主服务以重建 `agy acp` 子进程）即可生效；未设置该变量时保持原厂默认行为。
 
 ---
 
@@ -88,9 +90,9 @@ sudo python3 ~/agy-context-unlock/agy_context_unlock.py restore --binary /usr/bi
 
 | 命令 | 用途说明 |
 |---|---|
-| `python3 agy_context_unlock.py locate --binary /usr/bin/agy` | 纯只读检查 Go 符号表与 5 处补丁位点的可修补状态 |
-| `sudo python3 agy_context_unlock.py patch --binary /usr/bin/agy --in-place --yes --allow-system [--allow-unknown]` | 原地应用 4 处核心补丁并备份/轮换原版（加 `--dry-run` 零写入预演） |
-| `python3 agy_context_unlock.py verify --binary /usr/bin/agy` | 只读校验 4 处必选补丁是否均已生效 |
+| `python3 agy_context_unlock.py locate --binary /usr/bin/agy` | 纯只读检查 Go 符号表与 6 处补丁位点的可修补状态 |
+| `sudo python3 agy_context_unlock.py patch --binary /usr/bin/agy --in-place --yes --allow-system [--allow-unknown]` | 原地应用 5 处核心补丁并备份/轮换原版（加 `--dry-run` 零写入预演） |
+| `python3 agy_context_unlock.py verify --binary /usr/bin/agy` | 只读校验 5 处必选补丁是否均已生效 |
 | `sudo python3 agy_context_unlock.py restore --binary /usr/bin/agy` | 从同目录 `.agy-unlock-backup` 原子还原原版二进制 |
 | `sudo python3 agy_context_unlock.py pacman-hook --script-path <绝对路径> --write <Hook路径>` | 生成并写入 Pacman `PostTransaction` 自动修补 Hook |
 | `python3 agy_context_unlock.py install --patch --scope all --window 900000 [--allow-unknown]` | 可选方式（免 root）：在 `~/.local` 安装只读修补副本与 `agy-unlock` 启动器 |
@@ -105,9 +107,9 @@ sudo python3 ~/agy-context-unlock/agy_context_unlock.py restore --binary /usr/bi
 
 | 文档 | 内容概要 |
 |---|---|
-| **[《原理与使用指南》](docs/overview-and-guide.md)** | 面向所有读者的通俗导读：本地压缩触发流程、三种 Token 口径、`/model` 与 `settings.json` 持久化闭环、不同模型家族物理上界、双通道对照与常见误区澄清 |
-| **[《CLI 命令参考、安全机制与支持契约》](docs/cli-and-support-scope.md)** | 全部子命令与选项详解、原地修补 / Pacman Hook / 免 root 独立副本部署、GDB 与在线验证工具参考、退出码契约与故障排查 |
-| **[《二进制补丁与脚本实现详解》](docs/binary-patch-internals.md)** | ELF64 + Go `pclntab` 动态符号解析、`/model` 持久化写入与读取逆向、4 处核心补丁（20 字节）与可选补丁逐字节汇编对比，以及 `1.5.7` 兼容性变更记录 |
+| **[《原理与使用指南》](docs/overview-and-guide.md)** | 面向所有读者的通俗导读：本地压缩触发流程、三种 Token 口径、`/model` 与 `settings.json` 持久化闭环、无头 ACP 模式兜底机制、不同模型家族物理上界、双通道对照与常见误区澄清 |
+| **[《CLI 命令参考、安全机制与支持契约》](docs/cli-and-support-scope.md)** | 全部子命令与选项详解、交互式与 ACP 窗口配置、原地修补 / Pacman Hook / 免 root 独立副本部署、GDB 与在线验证工具参考、退出码契约与故障排查 |
+| **[《二进制补丁与脚本实现详解》](docs/binary-patch-internals.md)** | ELF64 + Go `pclntab` 动态符号解析、`/model` 持久化写入与读取逆向、5 处核心补丁（39–42 字节）与可选补丁逐字节汇编对比，以及 `1.5.7`–`1.5.14` 兼容性与备份安全记录 |
 | **[《技术报告：Google OAuth 原生通道》](docs/mechanism-native-oauth.md)** | 原生通道完整代码路径、`ContextWindowMetadata` 本地构造汇编、TLS 抓包键树与逐轮 Token 实测数据（`1.5.1` 原始取证记录） |
 | **[《技术报告：企业网关通道》](docs/mechanism-enterprise-gateway.md)** | `/v1beta` 企业网关与自定义模型推导链路、本地反向代理抓包、Gemini 与 DeepSeek 多模型对比实验及证据边界（`1.5.1` 原始取证记录） |
 

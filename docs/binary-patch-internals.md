@@ -1,8 +1,8 @@
 # 二进制补丁与脚本实现详解（`agy_context_unlock.py`）
 
-> 本文档面向开发者、系统管理员与逆向工程研究人员，详细说明 `agy_context_unlock.py` 的内部实现原理、Go 1.18+ 符号表动态定位算法、4 处核心补丁（20 字节）的 x86-64 反汇编前后对比，以及 `/model` 交互菜单将上下文窗口持久化至 `settings.json` 的完整调用链。
+> 本文档面向开发者、系统管理员与逆向工程研究人员，详细说明 `agy_context_unlock.py`（当前版本 `v2.2.0`）的内部实现原理、Go 1.18+ 符号表动态定位算法、5 处核心补丁（`1.5.7` 锚点共 42 字节，`1.5.14+` 为 39 字节）的 x86-64 反汇编前后对比，以及 `/model` 持久化闭环与无头 `agy acp` 环境变量兜底机制。
 >
-> 当前文档的地址、哈希与反汇编均以 **`antigravity-cli` 1.5.7**（Linux x86-64，`SHA256: 5df525a2d6908989c57b897723caea66e00d7c4d2e24411f91ad306989574642`）为准；1.5.7 更新前的补丁线保存在标签 **`v1.5.5`**。配套文档导航：
+> 当前文档的锚点地址、哈希与反汇编示例以 **`antigravity-cli` 1.5.7**（Linux x86-64，`SHA256: 5df525a2d6908989c57b897723caea66e00d7c4d2e24411f91ad306989574642`）为准；`model-gate` 与 `acp-override` 采用调用指令符号锚定，已实测兼容至 `1.5.13`–`1.5.14+`；1.5.7 更新前的补丁线保存在标签 **`v1.5.5`**。配套文档导航：
 > - 通俗概念导读与双通道差异见 [《原理与使用指南》（`overview-and-guide.md`）](overview-and-guide.md)
 > - 全部命令选项、部署方式、验证工具与支持契约见 [《CLI 命令参考、安全机制与支持契约》（`cli-and-support-scope.md`）](cli-and-support-scope.md)
 > - 双通道原始取证报告见 [《Google OAuth 原生通道技术报告》（`mechanism-native-oauth.md`）](mechanism-native-oauth.md) 与 [《企业网关通道技术报告》（`mechanism-enterprise-gateway.md`）](mechanism-enterprise-gateway.md)
@@ -14,8 +14,8 @@
 `antigravity-cli`（`/usr/bin/agy`）是一个体积约 268 MiB（280,564,136 字节）的 Go 语言编译生成的 Linux x86-64 PIE（位置无关可执行）二进制文件。为了在不依赖外部工具链的前提下安全、可靠地解除其 256K 本地上下文压缩限制，`agy_context_unlock.py` 采用以下架构设计：
 
 1. **零外部依赖**：完全基于 Python 3 标准库（`struct`、`hashlib`、`tempfile` 等）实现 ELF64 与 Go `pclntab` 解析，无需安装 `objdump`、`radare2` 或任何第三方 Python 包即可独立运行。
-2. **动态符号定位而非硬编码文件偏移**：先通过 Go 运行时符号表找到目标函数的精确起止边界 `[fn.va, fn.end)`，再在函数内部匹配唯一的指令签名（instruction signature）。即使小版本更新导致函数地址整体偏移，只要目标函数内部逻辑未变，脚本仍可利用 `--allow-unknown` 自动完成定位与修补。
-3. **打通原生持久化配置闭环**：通过恢复 `store.(*Store).ContextWindow` 到 `store.(*Store).ContextWindowChoice` 的调用链，使 `~/.gemini/antigravity-cli/settings.json` 与交互式 `/model` 菜单直接生效，无需依赖外部包装脚本（wrapper）或终端环境变量。
+2. **动态符号定位而非硬编码文件偏移**：先通过 Go 运行时符号表找到目标函数的精确起止边界 `[fn.va, fn.end)`，再在函数内部匹配唯一指令签名或以 `call rel32` 目标符号为锚点定位。即使小版本更新导致函数地址整体偏移或局部栈槽位移（如 `1.5.14`），脚本仍可利用 `--allow-unknown` 自动完成定位与修补。
+3. **打通原生持久化闭环与 ACP 无头覆盖**：一方面恢复 `store.(*Store).ContextWindow` 到 `store.(*Store).ContextWindowChoice` 的调用链，使 `~/.gemini/antigravity-cli/settings.json` 与交互式 `/model` 菜单直接生效；另一方面在 `buildCascadeConfigInternal` 中为无头 `agy acp` 路径增加 `AGY_CLI_AUTO_COMPACT_OVERRIDE` 兜底读取，同时保持交互模式与未设环境变量时的原厂行为不变。
 
 ---
 
@@ -56,13 +56,15 @@
 [i] symbols: 185124
 ```
 
-1.5.7 的 `pclntab` 主表位于 `0x17652a0`；指向它的 `moduledata` 结构体位于 `0xd2406c0`，其 `+0xa0` / `+0xb0` 重定位值均为 `0x6eef080`，即代码基址。5 个关键锚点函数如下：
+1.5.7 的 `pclntab` 主表位于 `0x17652a0`；指向它的 `moduledata` 结构体位于 `0xd2406c0`，其 `+0xa0` / `+0xb0` 重定位值均为 `0x6eef080`，即代码基址。7 个关键锚点函数如下：
 
 | 符号后缀 | 虚拟地址（VA） | 函数结束地址 | 作用 |
 |---|---:|---:|---|
 | `model.SelectorModel.offersContextWindow` | `0xa6a03c0` | `0xa6a05c0` | 控制 `/model` 菜单是否显示 `Context` 档位切换器 |
 | `store.(*Store).ContextWindowChoice` | `0xa3fdea0` | `0xa3fdee0` | 读取并校验 `settings.json` 中的 `"contextWindow"` 字段 |
 | `store.(*Store).ContextWindow` | `0xa3fdee0` | `0xa3fe160` | 解析当前生效的上下文窗口字符串（白名单、环境变量、配置文件） |
+| `store.AutoCompactOverrideSpec` | `0xa3fdc00` | `0xa3fdc40` | 读取并去空白 `AGY_CLI_AUTO_COMPACT_OVERRIDE` 环境变量（供 `acp-override` 兜底调用） |
+| `backend.ContextWindow.MaxTokenLimit` | `0xa0789e0` | `0xa078a60` | 将 `"900K"` / `"512K"` / `"900000"` 解析为整数 Token 上限 |
 | `backend.(*ServerBackend).buildCascadeConfigInternal` | `0xa08c3a0` | `0xa08d180` | 将上下文窗口上限写入 `CheckpointConfig.MaxTokenLimit` |
 | `utils.GetCheckpointConfig` | `0x84f5ce0` | `0x84f6220` | 推导模型默认 Checkpoint 配置（含 `256000` 兜底钳位） |
 
@@ -131,9 +133,9 @@
 
 ---
 
-## 4. 四个核心补丁（20 字节）逐字节详解
+## 4. 五个核心补丁（`1.5.7` 锚点 42 字节；`1.5.14+` 39 字节）逐字节详解
 
-为了将上述被阻断的链路彻底修复，`agy_context_unlock.py` 定义了 4 个必选补丁（共修改 20 个字节）与 1 个可选补丁。
+为了将交互式配置读取链与无头 ACP 环境变量兜底链全部打通，`agy_context_unlock.py` 定义了 5 个必选补丁（在 `1.5.7`–`1.5.13` 上共修改 **42 字节**，在 `1.5.14+` 上因 `acp-override` 槽位缩为 19 字节而共修改 **39 字节**）与 1 个可选补丁。
 
 ### 补丁 1：`ui-selector`（修改 6 字节）
 
@@ -196,41 +198,73 @@
     a3fe013: c3                      ret
   ```
 
-### 补丁 4：`model-gate`（匹配 12 字节，实际修改 1 字节）
+### 补丁 4：`model-gate`（符号锚定 4 字节，实际修改 1 字节）
 
 - **目标函数**：`backend.(*ServerBackend).buildCascadeConfigInternal`（`0xa08c3a0`）
 - **文件偏移 / 虚拟地址**：`0xa08d0cb`（`test` 指令位于 `0xa08d0c9`）
+- **定位方式（`v2.2.0` 起）**：通过函数内唯一的 `call proto.Equal` 指令锚定紧随其后的 `test %al,%al; jne <stub_len>`，并校验紧接在后的退出桩 `mov disp(%rsp),%rcx; jmp ret` 长度与跳转偏移一致，不再硬编码栈槽偏移 `0xb0(%rsp)`，因此可自动适配 `1.5.14` 的 `0x88(%rsp)` 栈槽位移。
 - **作用**：`buildCascadeConfigInternal` 在 `0xa08d083` 获取上下文窗口字符串（如 `"900K"`），并在 `0xa08d088` 调用 `ContextWindow.MaxTokenLimit()` 将其转换为整数 `900000`。但在写入 `CheckpointConfig.MaxTokenLimit`（`0xa08d0e9: mov %ecx, 0xc(%rax)`）前，`0xa08d0c4` 调用了 `proto.Equal` 比较模型对象。补丁将 `0xa08d0cb` 处的条件跳转 `jne`（`75`）改为无条件跳转 `jmp`（`eb`），确保任何非零窗口上限均无条件写入 `CheckpointConfig`。
-- **指令对比**：
+- **指令对比（以 `1.5.7` 为例）**：
   ```text
-  修改前 (84 c0 75 0a 48 8b 8c 24 b0 00 00 00):
+  修改前 (84 c0 75 0a):
     a08d0c9: 84 c0                   test   %al,%al
     a08d0cb: 75 0a                   jne    a08d0d7
-    a08d0cd: 48 8b 8c 24 b0 00 00 00 mov    0xb0(%rsp),%rcx
+    a08d0cd: 48 8b 8c 24 b0 00 00 00 mov    0xb0(%rsp),%rcx   # 1.5.14 为 0x88(%rsp)
 
-  修改后 (84 c0 eb 0a 48 8b 8c 24 b0 00 00 00):
+  修改后 (84 c0 eb 0a):
     a08d0c9: 84 c0                   test   %al,%al
     a08d0cb: eb 0a                   jmp    a08d0d7
     a08d0cd: 48 8b 8c 24 b0 00 00 00 mov    0xb0(%rsp),%rcx
   ```
 
-### 可选补丁 5：`default-clamp`（默认不启用，通过 `--with-default-clamp` 开启）
+### 补丁 5：`acp-override`（动态解析 19–22 字节）
+
+- **目标函数**：`backend.(*ServerBackend).buildCascadeConfigInternal`（`1.5.7` 为 `0xa08c3a0`，位于函数内 `+0xce8`）
+- **符号锚定与跨版本兼容（1.5.7–1.5.14+）**：`model-gate` 与 `acp-override` 分别通过函数内唯一的 `call proto.Equal` 与 `call backend.(*ServerBackend).ContextWindow` 指令进行符号定位，不硬编码栈槽偏移（例如 `1.5.14` 中 `CascadeConfig` 栈槽由 `0xb0(%rsp)` 变为 `0x88(%rsp)`，且退出跳转由 5 字节 `e9` 变为 2 字节 `eb`，槽位由 22 字节缩为 19 字节）。核心机器码恰好为 **19 字节**，在 22 字节槽位（`1.5.7`–`1.5.13`）自动末尾补 3 字节 `nop`，在 19 字节槽位（`1.5.14`）零填充精确落位。
+- **背景与原因**：在无头 ACP 模式（`agy acp`，如 T3 Code）下，`cli/acp/server` 从未创建交互式 `store.Manager`，也从未调用 `ServerBackend.SetContextWindow()`，因此每次构造请求配置时 `ServerBackend.ContextWindow()` 均返回空串 `""`，导致 `MaxTokenLimit()` 返回 `0` 并直接跳过写入 `CheckpointConfig.MaxTokenLimit`。
+- **作用**：在 `call ServerBackend.ContextWindow` 之后先检查返回字符串长度 `%rbx`：
+  - 若非空（交互式 TUI 已由 `store.Manager` 设定），直接跳过兜底调用，完全不改变交互式行为；
+  - 若为空（ACP 模式或未设定），调用二进制内置函数 `store.AutoCompactOverrideSpec()`（即 `strings.TrimSpace(os.Getenv("AGY_CLI_AUTO_COMPACT_OVERRIDE"))`，零参数、无锁、返回 `(%rax, %rbx)`），再交由 `backend.ContextWindow.MaxTokenLimit()` 解析（原生支持 `"900K"`、`"512K"`、`"900000"` 等格式）；
+  - 若解析结果仍为 `0`（环境变量未设置或格式无效），短跳转复用 `model-gate` 紧后方的退出桩 `mov disp(%rsp), %rcx; jmp ret`（`1.5.7`–`1.5.13` 为 `0xb0(%rsp)`，`1.5.14` 为 `0x88(%rsp)`），保持原厂默认行为。
+- **Go 运行时安全校验**：该 19–22 字节区间完全位于单一常量 `pcsp`（栈帧深度恒定）、`UnsafePoint = -1`（安全点）与单一 `StackMapIndex` 区间内，且不修改任何指针槽位，对 Go GC、栈扩容与异步抢占完全安全。
+- **指令对比（以 1.5.7 锚点 `0xa08d088` 为例，目标偏移按构建动态计算）**：
+  ```text
+  修改前 (22 字节):
+    a08d088: e8 53 b9 fe ff          call   backend.ContextWindow.MaxTokenLimit
+    a08d08d: 85 c0                   test   %eax,%eax
+    a08d08f: 75 0d                   jne    a08d09e
+    a08d091: 48 8b 8c 24 b0 00 00 00 mov    0xb0(%rsp),%rcx
+    a08d099: e9 7d 00 00 00          jmp    a08d11b
+
+  修改后 (22 字节):
+    a08d088: 48 85 db                test   %rbx,%rbx
+    a08d08b: 75 05                   jne    a08d092
+    a08d08d: e8 <rel32>              call   store.AutoCompactOverrideSpec
+    a08d092: e8 <rel32>              call   backend.ContextWindow.MaxTokenLimit
+    a08d097: 85 c0                   test   %eax,%eax
+    a08d099: 74 <rel8>               je     a08d0cd   # model-gate 后的退出桩
+    a08d09b: 90 90 90                nop ; nop ; nop
+  ```
+
+### 可选补丁 6：`default-clamp`（默认不启用，通过 `--with-default-clamp` 开启）
 
 - **目标函数**：`utils.GetCheckpointConfig`（`0x84f5ce0`）
 - **文件偏移 / 虚拟地址**：`0x84f5e02`（函数内偏移 `+0x122`）
-- **作用**：将未配置任何窗口档位时的本地默认钳位常数 `0x3e800`（`256000`，小端字节 `00 e8 03 00`）替换为 `1048576`（`1 << 20`，小端字节 `00 00 10 00`）。由于补丁 1–4 已经打通了 `settings.json` 与 `/model` 菜单的档位控制，保留默认 `256000` 钳位可使 `/model` 中的“默认”档位维持原厂行为，故该补丁默认设为可选。
+- **作用**：将未配置任何窗口档位时的本地默认钳位常数 `0x3e800`（`256000`，小端字节 `00 e8 03 00`）替换为 `1048576`（`1 << 20`，小端字节 `00 00 10 00`）。由于补丁 1–5 已经打通了 `settings.json`、`/model` 菜单以及 ACP 环境变量的档位控制，保留默认 `256000` 钳位可使 `/model` 中的“默认”档位及未配置环境变量的 ACP 会话维持原厂行为，故该补丁默认设为可选。
 
 ---
 
-## 5. 1.5.7 兼容性修复记录
+## 5. 跨版本兼容性与备份安全记录（`1.5.7`–`1.5.14`）
 
-| 项目 | 1.5.5 及更早（标签 `v1.5.5`） | 1.5.7（main） |
+### 5.1 `1.5.7` 结构体偏移修复记录
+
+| 项目 | 1.5.5 及更早（标签 `v1.5.5`） | 1.5.7–1.5.14（`main`） |
 |---|---|---|
 | `settings-window` 匹配签名 | `48 8b 8c 24 08 01 00 00 48 8b 89 b8 00 00 00` | `48 8b 8c 24 08 01 00 00 48 8b 49 58` |
 | `Store.featureProvider` 偏移 | `+0xb8` | `+0x58` |
 | `ContextWindowChoice` 逻辑 | 读取 `cliSetting.ContextWindow`（`+0x70/+0x78`） | 未变 |
 | 白名单 | `["Gemini 4 Argon"]` | 未变 |
-| 其余三个补丁签名 | 见上 | 未变，仍精确匹配 |
+| `model-gate` / `acp-override` 定位 | 固定 12B 签名（无 `acp-override`） | 符号锚定 `call proto.Equal` 与 `call ServerBackend.ContextWindow` |
 
 1.5.7 升级后，旧脚本在 `settings-window` 处安全中止，输出：
 
@@ -240,14 +274,27 @@
 
 这是因为旧签名覆盖了 `featureProvider` 的字段读取指令，而该结构体字段发生了位移。脚本的 `cmd_patch` 会先在内存中应用全部补丁，任一必选补丁失败即返回，**不会写回文件**，因此不会留下部分修补的二进制。
 
-此外，`--in-place` 现在会检查已有 `.agy-unlock-backup` 的 SHA 是否与当前源二进制一致；不一致时先把旧备份轮换为 `.agy-unlock-backup.<旧SHA前8位>`，再备份当前 1.5.7，避免 `restore` 恢复到升级前的旧版本。
+### 5.2 `1.5.13`–`1.5.14` 符号锚定与增量备份保护（`v2.2.0`）
 
-修复后对 1.5.7 原版与修补版的 GDB 零 Token 验证结果：
+1. **应对 `1.5.14` 的栈槽与短跳转变化**：
+   - 在 `1.5.14` 中，`buildCascadeConfigInternal` 的 `CascadeConfig` 栈槽从 `0xb0(%rsp)` 移至 `0x88(%rsp)`，同时 `acp-override` 退出桩内的 `jmp ret` 从 5 字节 `e9` 变为 2 字节 `eb`，导致原位可复用槽位从 22 字节缩减为 **19 字节**。
+   - `v2.2.0` 将 `model-gate` 与 `acp-override` 升级为基于 `call proto.Equal` 与 `call ServerBackend.ContextWindow` 的符号定位，动态校验退出桩（兼容 `disp8`/`disp32` 栈槽与 `eb`/`e9` 跳转），并将 `acp-override` 核心序列压至 **19 字节**（22 字节槽位末尾自动补 3×`nop`，19 字节槽位零填充精确落位），实现 `1.5.7`–`1.5.14+` 零手工适配。
+2. **原地修补备份的双重保护**：
+   - **跨软件包升级自动轮换（`_ensure_backup`）**：`--in-place` 会比对既有 `.agy-unlock-backup` 与当前源二进制的 SHA256；不一致时先将旧备份轮换为 `.agy-unlock-backup.<旧SHA前8位>`，再备份新版原厂二进制，避免 `restore` 误降级。
+   - **同版本增量叠加保留干净备份（`_backup_matches_clean_source`）**：当用户升级 `agy-context-unlock` 自身并在已含旧版补丁（例如旧版 4 补丁）的 `/usr/bin/agy` 上原地增量叠加新补丁（如新增 `acp-override`）时，脚本会将源二进制中已应用的补丁在内存中重放到既有 `.agy-unlock-backup` 上并核对 SHA256；若完全吻合，即证明既有备份正是干净原版，打印 `keeping existing clean backup` 并原地保留，不再误轮换或覆盖干净备份。
 
-| 二进制 | `CTXWINDOW_STRING_LEN` | `CTXWINDOW_LIMIT` | `PROTO_EQUAL` | `WRITE_MAXTOKEN` |
-|---|---:|---:|---:|---:|
-| 1.5.7 原版 | `0` | `0` | *未触发* | *未写入* |
-| 1.5.7 + 补丁 | `4`（`"900K"`） | `900000` | `1` | `900000` |
+### 5.3 GDB 零 Token 动态寄存器实测结果
+
+在 `1.5.7` 锚点及 `1.5.13` / `1.5.14` 上，通过 `tools/gdb_verify.py`（及 `agy acp` 同原理零 Token 断点）验证结果如下：
+
+| 场景 | 版本 | 环境变量 `AGY_CLI_AUTO_COMPACT_OVERRIDE` | `CTXWINDOW_STRING_LEN` | `CTXWINDOW_LIMIT` | `PROTO_EQUAL` | `WRITE_MAXTOKEN` |
+|---|---|---|---:|---:|---:|---:|
+| 交互式 `agy -p`（未修补） | `1.5.7` | *未设置* | `0` | `0` | *未触发* | *未写入* |
+| 交互式 `agy -p`（读 `settings.json` `"900K"`） | `1.5.7` / `1.5.13` | *未设置* | `4` | `900000` | `1` | `900000` |
+| 无头 `agy acp`（已修补 `v2.2.0`） | `1.5.13` | `900K` | `0`（兜底读入长度 `4`） | `900000` | `1` | `900000` |
+| 无头 `agy acp`（已修补 `v2.2.0`） | `1.5.13` | `900000` | `0`（兜底读入长度 `6`） | `900000` | `1` | `900000` |
+| 无头 `agy acp`（已修补 `v2.2.0`） | `1.5.13` | *未设置* | `0`（兜底读入长度 `0`） | `0` | *未触发* | *未写入（原厂默认）* |
+| 无头 `agy acp`（已修补 `v2.2.0`） | `1.5.14` | `900K` | `0`（兜底读入长度 `4`） | `900000` | `1` | `900000` |
 
 ---
 
@@ -259,7 +306,7 @@
 # 1. 解析二进制符号表并查看各补丁位点状态（只读）
 python3 agy_context_unlock.py locate --binary /usr/bin/agy
 
-# 2. 运行 1.5.7 锚点离线自检，验证 5 个锚点符号地址与 20 字节精确差异（只读）
+# 2. 运行 1.5.7 锚点离线自检，验证 7 个锚点符号地址与 42 字节精确差异（只读）
 python3 agy_context_unlock.py self-test --binary /usr/bin/agy
 
 # 3. 生成修补后的二进制文件（默认输出为 /path/to/agy.patched）
@@ -268,12 +315,12 @@ python3 agy_context_unlock.py patch --binary /usr/bin/agy --out /tmp/agy.patched
 # 4. 原地修补系统二进制（自动备份/轮换 /usr/bin/agy.agy-unlock-backup；1.5.7 之后兼容版本加 --allow-unknown）
 sudo python3 agy_context_unlock.py patch --binary /usr/bin/agy --in-place --yes --allow-system --allow-unknown
 
-# 5. 校验二进制文件中的 4 处必选补丁是否已生效（只读）
+# 5. 校验二进制文件中的 5 处必选补丁是否已生效（只读）
 python3 agy_context_unlock.py verify --binary /usr/bin/agy
 
-# 6. 生成 Arch Linux / EndeavourOS 的 Pacman 自动更新 Hook
+# 6. 生成 Arch Linux / EndeavourOS 的 Pacman 自动更新 Hook（推荐先安装至 /usr/local/share/agy-context-unlock/）
 sudo python3 agy_context_unlock.py pacman-hook \
-  --script-path ~/agy-context-unlock/agy_context_unlock.py \
+  --script-path /usr/local/share/agy-context-unlock/agy_context_unlock.py \
   --write /etc/pacman.d/hooks/99-agy-context-unlock.hook
 
 # 7. 从备份还原原版二进制

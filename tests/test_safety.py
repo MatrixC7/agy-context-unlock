@@ -20,7 +20,9 @@ import agy_context_unlock as unlock  # noqa: E402
 import verify_live as verify  # noqa: E402
 
 BIN = Path("/usr/bin/agy")
+BACKUP_BIN = Path("/usr/bin/agy.agy-unlock-backup")
 HAS_TARGET = BIN.exists() and hashlib.sha256(BIN.read_bytes()).hexdigest().startswith("5df525a2d6908989")
+CLEAN_ANY_BIN = BACKUP_BIN if BACKUP_BIN.exists() else (BIN if BIN.exists() else None)
 
 
 class TestCompactionSummary(unittest.TestCase):
@@ -144,6 +146,72 @@ class TestPatcherSafety(unittest.TestCase):
             )
             self.assertEqual(r.returncode, 2)
             self.assertIn("--window", r.stderr)
+
+
+@unittest.skipUnless(CLEAN_ANY_BIN is not None, "no local agy binary present")
+class TestAcpOverrideAndIncrementalBackup(unittest.TestCase):
+    def test_acp_override_idempotent_and_order_independent(self):
+        assert CLEAN_ANY_BIN is not None
+        u1 = unlock.Unlocker(CLEAN_ANY_BIN)
+        # Apply acp-override BEFORE model-gate
+        by_key = {p.key: p for p in unlock.PATCHES}
+        for key in ("acp-override", "model-gate", "ui-selector", "store-gate", "settings-window"):
+            r = u1.apply(by_key[key])
+            self.assertIn(r.status, ("applied", "already"))
+        ok, problems = unlock._verify_patched(bytes(u1.data))
+        self.assertTrue(ok, problems)
+
+        # Apply in reverse order (model-gate BEFORE acp-override) -> exact same bytes
+        u2 = unlock.Unlocker(CLEAN_ANY_BIN)
+        for key in ("ui-selector", "store-gate", "settings-window", "model-gate", "acp-override"):
+            u2.apply(by_key[key])
+        self.assertEqual(bytes(u1.data), bytes(u2.data))
+
+        # Re-applying all required patches must be a no-op
+        for p in [x for x in unlock.PATCHES if not x.optional]:
+            self.assertEqual(u2.apply(p).status, "already")
+
+    def test_incremental_repatch_preserves_clean_backup(self):
+        assert CLEAN_ANY_BIN is not None
+        # Only run if CLEAN_ANY_BIN is genuinely unpatched at all core sites
+        probe = unlock.Unlocker(CLEAN_ANY_BIN)
+        if any(probe.inspect_patch(p)[0] == "patched" for p in unlock.PATCHES if not p.optional):
+            self.skipTest("candidate binary is not clean")
+        with tempfile.TemporaryDirectory() as td:
+            work_bin = Path(td) / "agy"
+            shutil.copy2(CLEAN_ANY_BIN, work_bin)
+            clean_sha = hashlib.sha256(work_bin.read_bytes()).hexdigest()
+
+            # Step 1: simulate an older 4-patch in-place install (without acp-override)
+            r1 = subprocess.run(
+                [sys.executable, str(ROOT / "agy_context_unlock.py"), "patch",
+                 "--binary", str(work_bin), "--in-place", "--yes", "--allow-unknown",
+                 "--patches", "ui-selector,store-gate,settings-window,model-gate"],
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(r1.returncode, 0, r1.stderr)
+            backup = Path(td) / "agy.agy-unlock-backup"
+            self.assertEqual(hashlib.sha256(backup.read_bytes()).hexdigest(), clean_sha)
+
+            # Step 2: upgrade in-place to all 5 core patches (adding acp-override)
+            r2 = subprocess.run(
+                [sys.executable, str(ROOT / "agy_context_unlock.py"), "patch",
+                 "--binary", str(work_bin), "--in-place", "--yes", "--allow-unknown"],
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(r2.returncode, 0, r2.stderr)
+            self.assertIn("keeping existing clean backup", r2.stdout)
+            # Clean backup must NOT have been rotated or overwritten by the 4-patch binary
+            self.assertEqual(hashlib.sha256(backup.read_bytes()).hexdigest(), clean_sha)
+            self.assertEqual(list(Path(td).glob("agy.agy-unlock-backup.*")), [])
+
+            # Step 3: verify passes
+            r3 = subprocess.run(
+                [sys.executable, str(ROOT / "agy_context_unlock.py"), "verify",
+                 "--binary", str(work_bin)],
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(r3.returncode, 0, r3.stdout + r3.stderr)
 
 
 if __name__ == "__main__":

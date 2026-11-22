@@ -1,8 +1,8 @@
 # CLI 命令参考、安全机制与支持契约
 
-> 本文档完整收录 `agy_context_unlock.py` 的全部子命令与选项说明、三种窗口持久化配置方式、原地修补与可选部署流程（Pacman 自动 Hook、免 root 独立副本）、验证与抓包工具、安全防护机制、退出码契约与常见故障排查。
+> 本文档完整收录 `agy_context_unlock.py`（当前版本 `2.2.0`）的全部子命令与选项说明、交互式与 ACP 无头模式的窗口配置方式、原地修补与可选部署流程（Pacman 自动 Hook、免 root 独立副本）、验证与抓包工具、安全防护机制、退出码契约与常见故障排查。
 > - 通俗概念导读与双通道差异见 [《原理与使用指南》（`overview-and-guide.md`）](overview-and-guide.md)
-> - 底层 ELF64 / Go `pclntab` 解析与 4 处核心补丁（20 字节）反汇编细节见 [《二进制补丁与脚本实现详解》（`binary-patch-internals.md`）](binary-patch-internals.md)
+> - 底层 ELF64 / Go `pclntab` 解析与 5 处核心补丁（39–42 字节）反汇编细节见 [《二进制补丁与脚本实现详解》（`binary-patch-internals.md`）](binary-patch-internals.md)
 > - 双通道原始实验报告见 [《Google OAuth 原生通道技术报告》（`mechanism-native-oauth.md`）](mechanism-native-oauth.md) 与 [《企业网关通道技术报告》（`mechanism-enterprise-gateway.md`）](mechanism-enterprise-gateway.md)
 
 ---
@@ -13,31 +13,31 @@
 
 | 子命令 | 是否修改磁盘文件 | 核心作用 |
 |---|:---:|---|
-| `locate` | 否（纯只读） | 解析 ELF64 与 Go `pclntab` 符号表，列出全部 5 个补丁位点的虚拟地址、偏移与当前状态（`patchable` / `already patched` / `NOT FOUND`） |
-| `patch` | 是（加 `--dry-run` 时不写盘） | 应用 4 处必选补丁（及可选 `default-clamp`），默认输出到 `<BINARY>.patched`，加 `--in-place` 时原地备份并覆盖 |
-| `verify` | 否（纯只读） | 校验目标二进制中 4 处必选补丁是否均已生效 |
+| `locate` | 否（纯只读） | 解析 ELF64 与 Go `pclntab` 符号表，列出全部 6 个补丁位点（5 处必选 + 1 处可选）的虚拟地址、偏移与当前状态（`patchable` / `already patched` / `NOT FOUND`） |
+| `patch` | 是（加 `--dry-run` 时不写盘） | 应用 5 处必选补丁（及可选 `default-clamp`），默认输出到 `<BINARY>.patched`，加 `--in-place` 时原地备份（或增量保留干净备份）并覆盖 |
+| `verify` | 否（纯只读） | 校验目标二进制中 5 处必选补丁是否均已生效 |
 | `restore` | 是 | 从备份文件（默认 `<BINARY>.agy-unlock-backup`）原子还原原版二进制 |
-| `self-test` | 否（纯只读） | 面向 `1.5.7` 锚点构建的严格离线自检：核对 5 个固定锚点符号虚拟地址及内存中施加必选补丁后的精确字节变更数 |
+| `self-test` | 否（纯只读） | 面向 `1.5.7` 锚点构建的严格离线自检：核对 7 个固定锚点符号虚拟地址及内存中施加 5 处必选补丁后的精确字节变更数（42 字节） |
 | `pacman-hook` | 仅带 `--write` 时写盘 | 生成或写入 Arch Linux / EndeavourOS / CachyOS 的 Pacman `PostTransaction` Hook 文件 |
 | `install` | 是 | 可选方式（免 root）：安装独立副本与 `agy-unlock` 包装启动器至指定前缀目录（默认 `~/.local`） |
 
 ### 1.2 全局与各子命令选项说明
 
 - **顶层选项**
-  - `--version`：打印脚本版本号（当前为 `2.1.0`）并退出。
+  - `--version`：打印脚本版本号（当前为 `2.2.0`）并退出。
   - `-h` / `--help`：打印顶层或对应子命令的帮助信息。
 - **全部子命令通用选项**
   - `--binary <path>`：目标 `agy` 二进制路径，默认 `/usr/bin/agy`。
   - `--json`：在支持的命令（`locate`）下附带输出 JSON 结构化信息。
 - **`patch` 专属选项**
   - `--out <path>`：指定修补后二进制的输出路径（未传 `--in-place` 且未传 `--out` 时，默认写入 `<BINARY>.patched`）。
-  - `--in-place`：原地覆盖目标二进制，并在写盘前自动备份或轮换同目录的 `<BINARY>.agy-unlock-backup`。
+  - `--in-place`：原地覆盖目标二进制，并在写盘前自动备份、增量保留干净原版备份或轮换同目录的 `<BINARY>.agy-unlock-backup`。
   - `--yes`：确认覆盖源二进制（当输出路径解析为源二进制时必传）。
   - `--allow-system`：允许原地覆盖系统路径 `/usr/bin/agy` 或 `/usr/local/bin/agy`。
   - `--dry-run`：仅在内存中匹配并预演补丁，不向磁盘写入任何文件。
-  - `--patches <list>`：以逗号分隔仅应用指定子集，可选值为 `ui-selector`、`store-gate`、`settings-window`、`model-gate`、`default-clamp`。
-  - `--with-default-clamp`：额外启用可选第 5 项补丁 `default-clamp`，将未设置窗口档位时的本地兜底 `256000` 钳位提升至 `1048576`（默认不启用，使 `/model` 中的“默认”档位保持原厂行为）。
-  - `--allow-unknown`：当目标二进制 SHA256 不是脚本内置的 `1.5.7` 锚点构建（例如已升级至 `1.5.8`–`1.5.12` 等兼容小版本）时放行结构化匹配；若任一必选补丁签名不匹配仍会安全中止。
+  - `--patches <list>`：以逗号分隔仅应用指定子集，可选值为 `ui-selector`、`store-gate`、`settings-window`、`model-gate`、`acp-override`、`default-clamp`。
+  - `--with-default-clamp`：额外启用可选第 6 项补丁 `default-clamp`，将未设置窗口档位时的本地兜底 `256000` 钳位提升至 `1048576`（默认不启用，使 `/model` 中的“默认”档位与未设环境变量的 ACP 会话保持原厂行为）。
+  - `--allow-unknown`：当目标二进制 SHA256 不是脚本内置的 `1.5.7` 锚点构建（例如已升级至 `1.5.8`–`1.5.14` 等兼容小版本）时放行结构化匹配；若任一必选补丁签名不匹配仍会安全中止。
 - **`restore` 专属选项**
   - `--backup <path>`：手动指定要还原的备份路径（默认为 `<BINARY>.agy-unlock-backup`；如需回退到轮换出的旧备份 `.agy-unlock-backup.<SHA前8位>` 可由此指定）。
 - **`pacman-hook` 专属选项**
@@ -52,23 +52,23 @@
   - `--shadow`：在 `<prefix>/bin/agy` 额外创建一个转发至 `agy-unlock` 的包装脚本（仅当 `<prefix>/bin` 位于 `PATH` 中 `/usr/bin` 之前时生效，且若已存在同名文件不会覆盖）。
   - `--allow-unknown`：对非 `1.5.7` 锚点 SHA256 的兼容构建放行安装。
 
-### 1.3 补丁生效后的三种窗口配置方式
+### 1.3 补丁生效后的窗口配置方式（交互式与 ACP 无头模式）
 
-应用 4 处核心补丁（共 20 字节）后，日常使用**无需包装启动器，也无需每次在终端传入环境变量**，以下三种方式按优先级从低到高协同工作：
+应用 5 处核心补丁（`1.5.7` 锚点共 42 字节，`1.5.14+` 为 39 字节）后，交互式日常使用**无需包装启动器，也无需每次在终端传入环境变量**；同时 `agy acp` 无头模式（如 T3 Code）可通过宿主环境变量直接配置。各方式按如下规则协同工作：
 
-1. **通过交互式 `/model` 菜单切换（自动持久化）**
+1. **交互式 CLI：通过 `/model` 菜单切换（自动持久化）**
    - 启动 `agy` 后输入 `/model` 打开模型选择器。
    - 按 **`Tab` 键**在 `默认`、`256K`、`512K`、`900K` 四档之间循环切换 `Context` 指示器。
    - 按 **`Enter` 键**确认。`agy` 会调用 `SetContextWindow` → `WriteCliSettings`，自动将 `"contextWindow": "900K"` 写入 `~/.gemini/antigravity-cli/settings.json` 并同步至当前会话；此后每次启动 `agy` 均会自动读取生效。
-2. **直接编辑 `settings.json`（持久化）**
+2. **交互式 CLI：直接编辑 `settings.json`（持久化）**
    - 在 `~/.gemini/antigravity-cli/settings.json` 中写入 `"contextWindow": "900K"`（亦支持 `"512K"` 或 `"256K"`）。
    - 交互模式与 `-p` 非交互模式启动时均会自动读取该字段。
-3. **环境变量 `AGY_CLI_AUTO_COMPACT_OVERRIDE`（最高优先级临时覆盖）**
-   - 引擎在读取 `settings.json` 之前先检查 `AGY_CLI_AUTO_COMPACT_OVERRIDE`。
-   - 当需要在特定脚本中临时指定任意整数阈值（例如 `600000`，或在 Argon / Flash 上释放至物理上界 `983040`），或针对企业网关中容量较小的自定义模型单独限流时，可执行：
+3. **环境变量 `AGY_CLI_AUTO_COMPACT_OVERRIDE`（交互式最高优先级覆盖 + ACP 无头模式主入口）**
+   - **在交互式 CLI（`agy` / `agy -p`）中**：引擎在读取 `settings.json` 之前先检查 `AGY_CLI_AUTO_COMPACT_OVERRIDE`。适合在脚本中临时指定任意整数阈值（例如 `600000`，或在 Argon / Flash 上释放至物理上界 `983040`），或针对企业网关中容量较小的自定义模型单独限流：
      ```bash
      AGY_CLI_AUTO_COMPACT_OVERRIDE=600000 agy -p "hello"
      ```
+   - **在 ACP 无头模式（`agy acp`，如 T3 Code）中**：`agy acp` 不会初始化交互式 `store.Manager`，也不读取 `settings.json` 中的 `"contextWindow"`。应用第 5 处补丁 `acp-override` 后，在宿主对应提供方环境变量（例如 T3 Code 的「设置 → 智能体提供方 → Antigravity → 环境 → 变量」）中添加 `AGY_CLI_AUTO_COMPACT_OVERRIDE=900K`（注意 `K` 须大写，亦可填整数如 `900000`）并**新开会话**（或重启宿主服务以重建 `agy acp` 子进程）即可直接生效；未设置该变量时维持原厂默认行为。
 
 ### 1.4 部署方式一：原地修补 `/usr/bin/agy` 与升级轮换
 
@@ -78,25 +78,26 @@
 git clone https://github.com/MatrixC7/agy-context-unlock.git ~/agy-context-unlock
 cd ~/agy-context-unlock
 
-# 1. 只读检查目标函数与 4 处必选补丁位点
+# 1. 只读检查目标函数与 5 处必选（共 6 处）补丁位点
 python3 agy_context_unlock.py locate --binary /usr/bin/agy
 
 # 2. 原地修补 /usr/bin/agy（自动创建原版备份 /usr/bin/agy.agy-unlock-backup）
-#    若当前安装的是 1.5.7 之后的兼容版本（如 1.5.12），请加上 --allow-unknown
+#    若当前安装的是 1.5.7 之后的兼容版本（如 1.5.12–1.5.14），请加上 --allow-unknown
 sudo python3 ~/agy-context-unlock/agy_context_unlock.py patch \
   --binary /usr/bin/agy --in-place --yes --allow-system --allow-unknown
 
-# 3. 校验 4 处必选补丁状态
+# 3. 校验 5 处必选补丁状态
 python3 ~/agy-context-unlock/agy_context_unlock.py verify --binary /usr/bin/agy
 ```
 
 > 若系统仍停留在 `agy` `1.5.5`（或更早版本），请先执行 `git checkout v1.5.5`，否则 `1.5.7+` 的 `settings-window` 签名不会匹配。
 
-升级与旧备份轮换机制：
+升级、增量修补与旧备份轮换机制：
 - 由于 `/usr/bin/agy` 属主为 `root:root`，普通用户权限下运行的 `agy` 内置后台更新器不会覆盖该系统二进制。
-- 当系统包管理器升级 `antigravity-cli` 后，再次执行上述 `patch --in-place --yes --allow-system --allow-unknown` 时，脚本会比对既有 `/usr/bin/agy.agy-unlock-backup` 与当前源二进制的 SHA256：
-  - 若哈希一致：直接复用现有备份。
-  - 若哈希不一致（说明发生了软件包升级）：先将旧备份重命名为 `/usr/bin/agy.agy-unlock-backup.<旧SHA前8位>`，再把当前新版原厂二进制备份为 `/usr/bin/agy.agy-unlock-backup`，防止日后执行 `restore` 时误将系统降级到旧版本。
+- 当再次执行上述 `patch --in-place --yes --allow-system --allow-unknown` 时，脚本会按以下三种情形保护备份：
+  - **既有备份与源二进制哈希一致**：直接复用现有备份。
+  - **同版本增量叠加新补丁**（例如已应用旧版 4 处补丁，升级本工具后补充应用第 5 处补丁 `acp-override`）：脚本将当前源二进制上已存在的补丁在内存中重放至既有 `.agy-unlock-backup` 并比对 SHA256；吻合时打印 `keeping existing clean backup` 并**原地保留该干净原版备份**，不轮换也不覆盖。
+  - **软件包升级导致哈希不一致且重放不匹配**：先将旧备份重命名为 `/usr/bin/agy.agy-unlock-backup.<旧SHA前8位>`，再把当前新版原厂二进制备份为 `/usr/bin/agy.agy-unlock-backup`，防止日后执行 `restore` 时误将系统降级到旧版本。
 
 ### 1.5 部署方式二（可选）：Arch Linux / Pacman 升级自动修补 Hook
 
@@ -164,13 +165,13 @@ agy-unlock --model "Gemini 3.8 Flash (High)"
 
 ### 2.1 静态状态校验：`locate`、`verify` 与 `self-test` 的区别
 
-- **`locate`**：适用于任意兼容版本（包括 `1.5.7` 及后续 `1.5.12` 等小版本），按 Go 符号名动态定位函数并检查全部 5 个补丁签名的匹配情况（纯只读）。
-- **`verify`**：适用于任意兼容版本，检查 4 处必选补丁的修改后字节是否均已存在，全部存在返回退出码 `0`（纯只读）。
-- **`self-test`**：面向 **`1.5.7` 锚点构建**的严格回归检查，除验证内存中精确修改 20 字节外，还会比对 5 个硬编码的 `1.5.7` 函数虚拟地址；在其他版本上运行会因符号地址自然偏移而报告地址项 `[FAIL]`，此时请以 `locate` 与 `verify` 为准。
+- **`locate`**：适用于任意兼容版本（包括 `1.5.7` 及后续 `1.5.12`–`1.5.14` 等小版本），按 Go 符号名动态定位函数并检查全部 6 个补丁位点（5 处必选 + 1 处可选）的匹配情况（纯只读）。
+- **`verify`**：适用于任意兼容版本，检查 5 处必选补丁的修改后字节是否均已存在，全部存在返回退出码 `0`（纯只读）。
+- **`self-test`**：面向 **`1.5.7` 锚点构建**的严格回归检查，除验证内存中精确修改 42 字节外，还会比对 7 个硬编码的 `1.5.7` 函数虚拟地址；在其他版本上运行会因符号地址自然偏移而报告地址项 `[FAIL]`，此时请以 `locate` 与 `verify` 为准。
 
 ### 2.2 GDB 零 Token 动态寄存器验证（`tools/gdb_verify.py`）
 
-通过 GDB 启动 `agy`，在配置构造函数 `backend.(*ServerBackend).buildCascadeConfigInternal` 返回前（尚未发出任何网络推理请求，消耗 **0 Token**）读取上下文窗口相关寄存器并终止进程。5 个断点偏移均由 `model-gate` 签名动态推导，不写死绝对虚拟地址。
+通过 GDB 启动 `agy`（测试期自动设置 `AGY_CLI_DISABLE_AUTO_UPDATE=1` 并将 `stdin` 重定向自 `/dev/null`），在配置构造函数 `backend.(*ServerBackend).buildCascadeConfigInternal` 返回前（尚未发出任何网络推理请求，消耗 **0 Token**）读取上下文窗口相关寄存器并终止进程。5 个断点偏移均由 `acp-override` 与 `model-gate` 符号位点及函数内写入/返回指令动态推导，不写死绝对虚拟地址，可跨 `1.5.7`–`1.5.14+` 自动适配栈槽位移。
 
 全部选项：
 - `--binary <path>`：待测 `agy` 二进制路径（默认 `/usr/bin/agy`）。
@@ -259,7 +260,7 @@ python3 -B -m unittest discover -s ~/agy-context-unlock/tests -v
 - **函数边界内唯一精确匹配**：每个补丁均先经 `pclntab` 解析目标函数范围 `[fn.va, fn.end)`，且映射至可执行节/段（`SHF_EXECINSTR` / `PF_X`），并要求目标机器码在函数内唯一匹配（或精确命中指定序号）。
 - **先内存全量预演、后原子写盘**：`patch` 会在内存中依次应用全部必选补丁；只要任意一项签名不匹配，脚本立即以退出码 `3` 返回，绝不写入磁盘，不会留下半修补二进制。
 - **系统二进制保护与显式确认**：原地覆盖 `/usr/bin/agy` 或 `/usr/local/bin/agy` 时强制要求同时传入 `--in-place --yes --allow-system`；非锚点 SHA256 构建强制要求显式 `--allow-unknown`。
-- **原子替换与旧备份自动轮换**：写盘通过同目录临时文件 + `fsync` + 保留原文件权限 + `os.replace` 实现；原地修补前若旧备份哈希与当前源二进制不同，自动轮换为 `.agy-unlock-backup.<旧SHA前8位>` 后再创建新备份。
+- **原子替换、增量干净备份保留与旧备份自动轮换**：写盘通过同目录临时文件 + `fsync` + 保留原文件权限 + `os.replace` 实现；原地增量叠加新补丁时通过内存重放哈希校验保留原有干净备份；跨软件包升级导致既有备份与当前源二进制哈希不同时，自动轮换为 `.agy-unlock-backup.<旧SHA前8位>` 后再创建新备份。
 
 ### 3.2 已知运行边界
 
@@ -280,7 +281,7 @@ python3 -B -m unittest discover -s ~/agy-context-unlock/tests -v
 |---|---|
 | 目标平台 | Linux x86-64（ELF64 小端序 Go 1.18+ PIE 二进制） |
 | 运行依赖 | Python 3 标准库（零第三方包依赖；`tools/gdb_verify.py` 另需 `gdb`，`tools/mitm_capture.py` 另需 `mitmproxy`） |
-| 当前 `main` 适配线 | `antigravity-cli >= 1.5.7`（锚点验证构建 `1.5.7`，`SHA256: 5df525a2d6908989c57b897723caea66e00d7c4d2e24411f91ad306989574642`；后续结构未变的兼容构建如 `1.5.12` 可经 `--allow-unknown` 直接定位并修补） |
+| 当前 `main` 适配线 | `antigravity-cli >= 1.5.7`（锚点验证构建 `1.5.7`，`SHA256: 5df525a2d6908989c57b897723caea66e00d7c4d2e24411f91ad306989574642`；后续兼容构建如 `1.5.12`–`1.5.14` 可经 `--allow-unknown` 直接定位并修补，`model-gate` / `acp-override` 采用调用符号锚定） |
 | 历史版本归档 | 仓库标签 **`v1.5.5`** 保留了 `1.5.7` 结构体变动前的补丁线（适用于 `1.5.1`–`1.5.5`，`Store.featureProvider` 位于 `+0xb8`） |
 
 ### 4.2 退出码契约
@@ -288,22 +289,25 @@ python3 -B -m unittest discover -s ~/agy-context-unlock/tests -v
 | 退出码 | `agy_context_unlock.py` | `verify_live.py` | `tools/gdb_verify.py` |
 |---:|---|---|---|
 | `0` | 操作成功、`verify` 确认全部必选补丁已存在，或 `patch --dry-run` / 幂等重复 `patch` 通过 | 成功跨过 256K 且未发生 `<= 256K` 的早期压缩 | 成功读取目标寄存器并在发请求前终止进程 |
-| `1` | `verify` 或 `self-test` 校验失败，或底层 `BinaryError`（ELF/符号解析异常） | 未跨过 256K 或发生早期压缩 | 无法在目标二进制中定位 `model-gate` 断点 |
-| `2` | 文件不存在、参数非法、SHA256 非锚点且未传 `--allow-unknown`、缺少 `--yes` / `--allow-system` 或备份不存在 | 参数非法、二进制不存在或 `--no-override` 与启动器冲突 | 二进制不存在 |
+| `1` | `verify` 或 `self-test` 校验失败，或底层 `BinaryError`（ELF/符号解析异常） | 未跨过 256K 或发生早期压缩 | —（GDB 子进程异常退出时抛出非零错误） |
+| `2` | 文件不存在、参数非法、SHA256 非锚点且未传 `--allow-unknown`、缺少 `--yes` / `--allow-system` 或备份不存在 | 参数非法、二进制不存在或 `--no-override` 与启动器冲突 | 二进制不存在，或无法在目标二进制中定位 `acp-override` / `model-gate` / 写入返回断点 |
 | `3` | 必选补丁签名在目标函数内未命中或出现歧义（未写入任何文件） | 运行日志中未找到会话 ID | — |
 | `4` | — | `agy` 子进程非零退出且未传 `--allow-failure` | — |
 
 ### 4.3 常见故障排查
 
 - **报错 `SHA256 ... is not the verified 1.5.7 build; use --allow-unknown to override`**
-  - 原因：本机 `antigravity-cli` 已升级到 `1.5.7` 之后的新小版本（如 `1.5.12`），脚本默认开启锚点哈希保护。
-  - 处理：先运行 `python3 ~/agy-context-unlock/agy_context_unlock.py locate --binary /usr/bin/agy` 确认 4 处必选补丁均显示 `patchable`（或 `already patched`），再在 `patch` 命令中追加 `--allow-unknown`。
+  - 原因：本机 `antigravity-cli` 已升级到 `1.5.7` 之后的新小版本（如 `1.5.12`–`1.5.14`），脚本默认开启锚点哈希保护。
+  - 处理：先运行 `python3 ~/agy-context-unlock/agy_context_unlock.py locate --binary /usr/bin/agy` 确认 5 处必选补丁均显示 `patchable`（或 `already patched`），再在 `patch` 命令中追加 `--allow-unknown`。
 - **报错 `settings-window: expected bytes not found in store.(*Store).ContextWindow`**
   - 原因：本机安装的是旧版 `agy`（`1.5.5` 或更早，字段偏移为 `+0xb8`），或未来新版再次调整了 `Store.featureProvider` 偏移。
   - 处理：脚本已安全中止且未改写二进制。若本机为 `1.5.5` 或更早版本，执行 `git checkout v1.5.5` 后重试；若为更新版本，则需等待针对新偏移的签名更新。
-- **运行 `self-test` 显示 5 个符号地址 `[FAIL]`，但 `verify` 显示 `verified`**
+- **运行 `self-test` 显示 7 个符号地址 `[FAIL]`，但 `verify` 显示 `verified`**
   - 原因：`self-test` 内置了 `1.5.7` 的绝对虚拟地址断言，新版 `agy` 重新编译后函数地址自然整体漂移，属于正常现象。
   - 处理：以 `locate` 与 `verify` 的动态结构校验结果为准。
+- **在 T3 Code 等 ACP 无头宿主中设置了 `AGY_CLI_AUTO_COMPACT_OVERRIDE` 但未生效**
+  - 原因：环境变量写到了其他提供方（如 Codex）名下、使用了小写 `k`（如 `900k` 而非 `900K` / `900000`）、`/usr/bin/agy` 尚未应用 `v2.2.0` 的 `acp-override` 补丁，或旧会话仍在复用修补前的 `agy acp` 常驻子进程。
+  - 处理：运行 `verify --binary /usr/bin/agy` 确认 `acp-override` 为 `PATCHED`；确认环境变量配置在 **Antigravity** 提供方下且值为 `900K` 或 `900000`；随后**新开一个 Antigravity 对话**（或重启宿主服务以重建 `agy acp` 进程）。
 - **Pacman 升级后 Hook 没有自动生效**
   - 原因：手写 `/etc/pacman.d/hooks/99-agy-context-unlock.hook` 时在 `Exec` 中使用了 `~` 或 `$HOME`（`libalpm` 不经过 shell 不会展开），或未包含 `--allow-unknown`。
   - 处理：使用 `pacman-hook --script-path <绝对路径> --write ...` 重新生成 Hook 文件。

@@ -1,10 +1,10 @@
 # 原理与使用指南：`antigravity-cli`（`agy`）的上下文压缩机制与解锁方案
 
-> **版本说明**：本文档的补丁地址与调用链已更新至 `antigravity-cli` 1.5.7；第 1.2、1.4 与第 2 节的逐轮 Token 实验数值来自 1.5.1 原始记录，1.5.7 的相关控制流与默认 256K 预算在静态结构上未变，1.5.1 的实测结论继续适用。1.5.7 更新前的补丁线保存在标签 `v1.5.5`。
+> **版本说明**：本文档的补丁地址与调用链以 `antigravity-cli` `1.5.7` 为锚点，并已同步涵盖 `v2.2.0` 新增的无头 ACP 模式环境变量兜底补丁（`acp-override`）及 `1.5.7`–`1.5.14` 兼容性说明；第 1.2、1.4 与第 2 节的逐轮 Token 实验数值来自 1.5.1 原始记录，相关控制流与默认 256K 预算在静态结构上未变，实测结论继续适用。1.5.7 更新前的补丁线保存在标签 `v1.5.5`。
 >
-> 本文档面向希望快速理解 `antigravity-cli`（`agy`）上下文限制成因、持久化配置逻辑以及解锁原理的用户与开发者。配套文档导航：
+> 本文档面向希望快速理解 `antigravity-cli`（`agy`）上下文限制成因、持久化配置逻辑、无头 ACP 模式适配以及解锁原理的用户与开发者。配套文档导航：
 > - 全部命令选项、部署方式、验证工具与退出码契约见 [《CLI 命令参考、安全机制与支持契约》（`cli-and-support-scope.md`）](cli-and-support-scope.md)
-> - 底层 ELF64 / Go `pclntab` 解析与 20 字节补丁反汇编细节见 [《二进制补丁与脚本实现详解》（`binary-patch-internals.md`）](binary-patch-internals.md)
+> - 底层 ELF64 / Go `pclntab` 解析与 5 处核心补丁（39–42 字节）反汇编细节见 [《二进制补丁与脚本实现详解》（`binary-patch-internals.md`）](binary-patch-internals.md)
 > - 双通道原始抓包与深度取证报告见 [《Google OAuth 原生通道技术报告》（`mechanism-native-oauth.md`）](mechanism-native-oauth.md) 与 [《企业网关通道技术报告》（`mechanism-enterprise-gateway.md`）](mechanism-enterprise-gateway.md)
 
 ---
@@ -88,14 +88,16 @@
        │
        ▼
   调用 backend.(*ServerBackend).buildCascadeConfigInternal (0xa08c3a0)
-       ├──► ContextWindow.MaxTokenLimit() 将 "900K" 解析为整数 900000
+       ├──► 调用 ServerBackend.ContextWindow() 获取窗口字符串
+       ├──► 若返回为空（无头 agy acp 模式）：[补丁 acp-override 兜底调用 store.AutoCompactOverrideSpec() 读取环境变量]
+       ├──► ContextWindow.MaxTokenLimit() 将 "900K" 或 "900000" 解析为整数 900000
        ├──► 门禁 3：检查 proto.Equal(model, selectedOverride) ──► [补丁 model-gate 改为无条件写入]
        └──► 将 900000 写入 CheckpointConfig.MaxTokenLimit (+0xc)
 ```
 
 简言之：
-- 在**未修补的原版 `agy` 1.5.7** 中，不仅 `/model` 里的 `[Tab] Context` 按钮对绝大多数模型隐藏（被 `offersContextWindow` 门禁挡住），而且就算手动在 `settings.json` 里写上 `"contextWindow": "900K"`，读取函数 `Store.ContextWindow` 也会因为内部 Feature Flag 关闭而直接返回空字符串，导致配置形同虚设。
-- 在**应用本项目的 4 个核心补丁（共 20 字节）**后，上述“UI 切换 → 写入 `settings.json` → 启动时自动从 `settings.json` 读取 → 写入 `CheckpointConfig.MaxTokenLimit`”形成完整闭环。用户既可以在 `/model` 菜单中按 `Tab` + `Enter` 永久切换档位，也可以直接编辑 `settings.json`，**日常使用完全无需手动指定环境变量**。
+- 在**未修补的原版 `agy` 1.5.7+** 中，不仅 `/model` 里的 `[Tab] Context` 按钮对绝大多数模型隐藏（被 `offersContextWindow` 门禁挡住），而且就算手动在 `settings.json` 里写上 `"contextWindow": "900K"`，读取函数 `Store.ContextWindow` 也会因为内部 Feature Flag 关闭而直接返回空字符串，导致配置形同虚设。
+- 在**应用本项目的 5 个核心补丁（`1.5.7` 锚点共 42 字节，`1.5.14+` 为 39 字节）**后，交互式场景下“UI 切换 → 写入 `settings.json` → 启动时自动从 `settings.json` 读取 → 写入 `CheckpointConfig.MaxTokenLimit`”形成完整闭环，**日常交互使用完全无需手动指定环境变量**；而无头 ACP 场景（见第 1.5 节）也能通过提供方环境变量直接生效。
 
 ---
 
@@ -114,6 +116,21 @@ $$\text{最终生效预算} = \min\big(\text{用户设定值},\ \text{MaxTokens}
 | **Gemini 4 Carbon** | `1,048,576` (1 Mi) | **`262,144`** (256 Ki) | `786,432` | `256,000` | **`786,432`** |
 
 > *注*：若需在 Argon / Flash 上进一步释放 `900,000` 至物理上界 `983,040` 之间的余量，可通过 `AGY_CLI_AUTO_COMPACT_OVERRIDE=983040` 指定，引擎同样会在安全上界内生效。对于单次最大输出扩展至 `262,144`（256 Ki）的 `Gemini 4 Carbon`，引擎自动将 `"900K"` 钳位在 `786,432` 是为了给单轮输出预留充足空间，不会触发内部校验错误。
+
+---
+
+### 1.5 无头 ACP 模式（如 T3 Code）下为何 `settings.json` 与旧补丁不生效？`acp-override` 如何工作？
+
+当外部宿主工具（例如 T3 Code）以无头协议模式拉起 `agy acp` 子进程时，`cli/acp/server` **不会创建交互式的 `store.Manager`**，也不会调用 `ServerBackend.SetContextWindow()`。因此，在 `backend.(*ServerBackend).buildCascadeConfigInternal` 中：
+- `ServerBackend.ContextWindow()` 始终返回空字符串 `""`；
+- 交互式 `store.(*Store).ContextWindow` 根本不会被调用，所以无论是 `~/.gemini/antigravity-cli/settings.json` 中的 `"contextWindow"`，还是单靠前 4 处补丁，都不会在 `agy acp` 中生效。
+
+为此，`v2.2.0` 引入第 5 处核心补丁 **`acp-override`**，在 `buildCascadeConfigInternal` 调用 `ServerBackend.ContextWindow()` 之后插入极简兜底逻辑：
+1. **交互式路径零干扰**：若 `ServerBackend.ContextWindow()` 返回非空（即 `agy` TUI 或 `agy -p` 已由 `store.Manager` 设定），直接跳过兜底调用，交互式行为与原有优先级完全不变。
+2. **无头 ACP 兜底读取**：若返回为空，则调用二进制内置的 `store.AutoCompactOverrideSpec()` 读取环境变量 `AGY_CLI_AUTO_COMPACT_OVERRIDE`（自动去除首尾空白），再交给 `backend.ContextWindow.MaxTokenLimit()` 解析（原生支持 `"900K"`、`"512K"`、`"256K"` 或整数如 `"900000"`；注意 `K` 须大写）。
+3. **未设置即保持原厂默认**：若未配置该环境变量或格式无效，解析结果为 `0` 并跳回原退出路径，不强行覆盖默认压缩阈值；已配置时，下游仍会经过第 1.4 节所述的 `ClampCheckpointConfigForModelInfo` 安全钳位。
+
+在 T3 Code 中使用时，只需在 **设置 → 智能体提供方 → Antigravity → 环境 → 变量** 中添加 `AGY_CLI_AUTO_COMPACT_OVERRIDE=900K`（或 `900000`），并**新开一个 Antigravity 对话**（或重启宿主服务以重建 `agy acp` 进程）即可生效。
 
 ---
 
