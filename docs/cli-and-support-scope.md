@@ -1,6 +1,6 @@
 # CLI 命令参考、安全机制与支持契约
 
-> 本文档完整收录 `agy_context_unlock.py`（当前版本 `2.2.0`）的全部子命令与选项说明、交互式与 ACP 无头模式的窗口配置方式、原地修补与可选部署流程（Pacman 自动 Hook、免 root 独立副本）、验证与抓包工具、安全防护机制、退出码契约与常见故障排查。
+> 本文档完整收录 `agy_context_unlock.py`（当前版本 `2.3.0`）的全部子命令与选项说明、交互式与 ACP 无头模式的窗口配置方式、原地修补与可选部署流程（Pacman 自动 Hook、免 root 独立副本）、验证与抓包工具、安全防护机制、退出码契约与常见故障排查。
 > - 通俗概念导读与双通道差异见 [《原理与使用指南》（`overview-and-guide.md`）](overview-and-guide.md)
 > - 底层 ELF64 / Go `pclntab` 解析与 5 处核心补丁（39–42 字节）反汇编细节见 [《二进制补丁与脚本实现详解》（`binary-patch-internals.md`）](binary-patch-internals.md)
 > - 双通道原始实验报告见 [《Google OAuth 原生通道技术报告》（`mechanism-native-oauth.md`）](mechanism-native-oauth.md) 与 [《企业网关通道技术报告》（`mechanism-enterprise-gateway.md`）](mechanism-enterprise-gateway.md)
@@ -17,14 +17,14 @@
 | `patch` | 是（加 `--dry-run` 时不写盘） | 应用 5 处必选补丁（及可选 `default-clamp`），默认输出到 `<BINARY>.patched`，加 `--in-place` 时原地备份（或增量保留干净备份）并覆盖 |
 | `verify` | 否（纯只读） | 校验目标二进制中 5 处必选补丁是否均已生效 |
 | `restore` | 是 | 从备份文件（默认 `<BINARY>.agy-unlock-backup`）原子还原原版二进制 |
-| `self-test` | 否（纯只读） | 面向 `1.5.7` 锚点构建的严格离线自检：核对 7 个固定锚点符号虚拟地址及内存中施加 5 处必选补丁后的精确字节变更数（42 字节） |
+| `self-test` | 否（纯只读） | 严格离线自检：对已收录的构建（`1.5.3`/`1.5.7`/`1.5.9`/`1.5.11`/`1.5.12`/`1.5.13`/`1.5.17`/`1.5.18`）核对锚点符号虚拟地址，并核对内存中施加 5 处必选补丁后的精确字节变更数；未收录的构建自动降级为“仅结构校验” |
 | `pacman-hook` | 仅带 `--write` 时写盘 | 生成或写入 Arch Linux / EndeavourOS / CachyOS 的 Pacman `PostTransaction` Hook 文件 |
 | `install` | 是 | 可选方式（免 root）：安装独立副本与 `agy-unlock` 包装启动器至指定前缀目录（默认 `~/.local`） |
 
 ### 1.2 全局与各子命令选项说明
 
 - **顶层选项**
-  - `--version`：打印脚本版本号（当前为 `2.2.0`）并退出。
+  - `--version`：打印脚本版本号（当前为 `2.3.0`）并退出。
   - `-h` / `--help`：打印顶层或对应子命令的帮助信息。
 - **全部子命令通用选项**
   - `--binary <path>`：目标 `agy` 二进制路径，默认 `/usr/bin/agy`。
@@ -37,7 +37,7 @@
   - `--dry-run`：仅在内存中匹配并预演补丁，不向磁盘写入任何文件。
   - `--patches <list>`：以逗号分隔仅应用指定子集，可选值为 `ui-selector`、`store-gate`、`settings-window`、`model-gate`、`acp-override`、`default-clamp`。
   - `--with-default-clamp`：额外启用可选第 6 项补丁 `default-clamp`，将未设置窗口档位时的本地兜底 `256000` 钳位提升至 `1048576`（默认不启用，使 `/model` 中的“默认”档位与未设环境变量的 ACP 会话保持原厂行为）。
-  - `--allow-unknown`：当目标二进制 SHA256 不是脚本内置的 `1.5.7` 锚点构建（例如已升级至 `1.5.8`–`1.5.14` 等兼容小版本）时放行结构化匹配；若任一必选补丁签名不匹配仍会安全中止。
+  - `--allow-unknown`：当目标二进制 SHA256 不属于脚本内置的已收录构建（见 `KNOWN_BUILDS`，当前覆盖 `1.5.3`–`1.5.18`）时放行结构化匹配；若任一必选补丁签名不匹配仍会安全中止。
 - **`restore` 专属选项**
   - `--backup <path>`：手动指定要还原的备份路径（默认为 `<BINARY>.agy-unlock-backup`；如需回退到轮换出的旧备份 `.agy-unlock-backup.<SHA前8位>` 可由此指定）。
 - **`pacman-hook` 专属选项**
@@ -50,11 +50,11 @@
   - `--scope <native-gemini|all>`：控制包装启动器在哪些模型下注入环境变量。`native-gemini`（默认）仅对 Google 原生 Gemini 生效；`all` 对所有模型（含企业网关自定义模型）生效。
   - `--patch`：将修补后的二进制副本写入 `<prefix>/share/agy-context-unlock/agy`，并将该副本与目录设为 `0555` 只读以阻止内置自动更新器覆盖；不加 `--patch` 时启动器直接调用系统原始 `--binary`。
   - `--shadow`：在 `<prefix>/bin/agy` 额外创建一个转发至 `agy-unlock` 的包装脚本（仅当 `<prefix>/bin` 位于 `PATH` 中 `/usr/bin` 之前时生效，且若已存在同名文件不会覆盖）。
-  - `--allow-unknown`：对非 `1.5.7` 锚点 SHA256 的兼容构建放行安装。
+  - `--allow-unknown`：对未收录 SHA256 的构建放行安装。
 
 ### 1.3 补丁生效后的窗口配置方式（交互式与 ACP 无头模式）
 
-应用 5 处核心补丁（`1.5.7` 锚点共 42 字节，`1.5.14+` 为 39 字节）后，交互式日常使用**无需包装启动器，也无需每次在终端传入环境变量**；同时 `agy acp` 无头模式（如 T3 Code）可通过宿主环境变量直接配置。各方式按如下规则协同工作：
+应用 5 处核心补丁（约 42 字节；`1.5.17` 为 42、`1.5.18` 为 43）后，交互式日常使用**无需包装启动器，也无需每次在终端传入环境变量**；同时 `agy acp` 无头模式（如 T3 Code）可通过宿主环境变量直接配置。各方式按如下规则协同工作：
 
 1. **交互式 CLI：通过 `/model` 菜单切换（自动持久化）**
    - 启动 `agy` 后输入 `/model` 打开模型选择器。
@@ -82,7 +82,7 @@ cd ~/agy-context-unlock
 python3 agy_context_unlock.py locate --binary /usr/bin/agy
 
 # 2. 原地修补 /usr/bin/agy（自动创建原版备份 /usr/bin/agy.agy-unlock-backup）
-#    若当前安装的是 1.5.7 之后的兼容版本（如 1.5.12–1.5.14），请加上 --allow-unknown
+#    已收录构建（1.5.3–1.5.18，见 KNOWN_BUILDS）无需 --allow-unknown；其他版本请加上
 sudo python3 ~/agy-context-unlock/agy_context_unlock.py patch \
   --binary /usr/bin/agy --in-place --yes --allow-system --allow-unknown
 
@@ -90,7 +90,7 @@ sudo python3 ~/agy-context-unlock/agy_context_unlock.py patch \
 python3 ~/agy-context-unlock/agy_context_unlock.py verify --binary /usr/bin/agy
 ```
 
-> 若系统仍停留在 `agy` `1.5.5`（或更早版本），请先执行 `git checkout v1.5.5`，否则 `1.5.7+` 的 `settings-window` 签名不会匹配。
+> 若系统仍停留在 `agy` `1.5.5`（或更早版本），请先执行 `git checkout v1.5.5`；`main` 分支使用通配布局自适应 `1.5.7`–`1.5.18`。
 
 升级、增量修补与旧备份轮换机制：
 - 由于 `/usr/bin/agy` 属主为 `root:root`，普通用户权限下运行的 `agy` 内置后台更新器不会覆盖该系统二进制。
@@ -127,7 +127,7 @@ sudo python3 /usr/local/share/agy-context-unlock/agy_context_unlock.py pacman-ho
 
 ```bash
 # 在 ~/.local/share/agy-context-unlock/agy 生成修补后的只读副本，
-# 并在 ~/.local/bin/agy-unlock 生成启动器（非 1.5.7 锚点构建请加 --allow-unknown）
+# 并在 ~/.local/bin/agy-unlock 生成启动器（未收录构建请加 --allow-unknown）
 python3 ~/agy-context-unlock/agy_context_unlock.py install \
   --patch --scope all --window 900000 --allow-unknown
 
@@ -165,9 +165,9 @@ agy-unlock --model "Gemini 3.8 Flash (High)"
 
 ### 2.1 静态状态校验：`locate`、`verify` 与 `self-test` 的区别
 
-- **`locate`**：适用于任意兼容版本（包括 `1.5.7` 及后续 `1.5.12`–`1.5.14` 等小版本），按 Go 符号名动态定位函数并检查全部 6 个补丁位点（5 处必选 + 1 处可选）的匹配情况（纯只读）。
+- **`locate`**：适用于任意兼容版本，按 Go 符号名动态定位函数（并自动在 `ContextWindow` 与 `AutoCompactWindow` 之间选择真实解析体），检查全部 6 个补丁位点（5 处必选 + 1 处可选）的匹配情况，输出实际命中的函数名与函数内偏移（纯只读）。
 - **`verify`**：适用于任意兼容版本，检查 5 处必选补丁的修改后字节是否均已存在，全部存在返回退出码 `0`（纯只读）。
-- **`self-test`**：面向 **`1.5.7` 锚点构建**的严格回归检查，除验证内存中精确修改 42 字节外，还会比对 7 个硬编码的 `1.5.7` 函数虚拟地址；在其他版本上运行会因符号地址自然偏移而报告地址项 `[FAIL]`，此时请以 `locate` 与 `verify` 为准。
+- **`self-test`**：严格回归检查。对 `KNOWN_BUILDS` 收录的构建，比对 `ANCHORS_BY_BUILD` 中的锚点虚拟地址并统计内存中精确修改的字节数；对未收录构建只做结构校验（锚点项自动跳过），不会因地址自然漂移而误报。
 
 ### 2.2 GDB 零 Token 动态寄存器验证（`tools/gdb_verify.py`）
 

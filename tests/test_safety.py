@@ -21,7 +21,7 @@ import verify_live as verify  # noqa: E402
 
 BIN = Path("/usr/bin/agy")
 BACKUP_BIN = Path("/usr/bin/agy.agy-unlock-backup")
-HAS_TARGET = BIN.exists() and hashlib.sha256(BIN.read_bytes()).hexdigest().startswith("5df525a2d6908989")
+HAS_TARGET = BIN.exists() and unlock.identify_build(hashlib.sha256(BIN.read_bytes()).hexdigest()) is not None
 CLEAN_ANY_BIN = BACKUP_BIN if BACKUP_BIN.exists() else (BIN if BIN.exists() else None)
 
 

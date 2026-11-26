@@ -6,7 +6,8 @@
 
 ## 核心特性
 
-- **恢复 `/model` 与 `settings.json` 原生持久化闭环 + 打通 ACP 宿主环境变量覆盖**：按 Go 符号名动态定位目标函数，精确修改 **5 处核心位点（`1.5.7` 锚点共 42 字节，`1.5.14+` 缩为 39 字节）**（`ui-selector`、`store-gate`、`settings-window`、`model-gate`、`acp-override`），恢复所有模型的 `[Tab] Context (256K / 512K / 900K)` 切换器与 `settings.json` 自动读取；同时让 `agy acp` 无头模式（如 T3 Code）在提供方环境变量中配置 `AGY_CLI_AUTO_COMPACT_OVERRIDE=900K`（或 `900000`）时直接生效。日常使用无需包装启动器（同时保留 `AGY_CLI_AUTO_COMPACT_OVERRIDE` 作为最高优先级临时覆盖）。
+- **恢复 `/model` 与 `settings.json` 原生持久化闭环 + 打通 ACP 宿主环境变量覆盖**：按 Go 符号名动态定位目标函数，精确修改 **5 处核心位点（约 42 字节）**（`ui-selector`、`store-gate`、`settings-window`、`model-gate`、`acp-override`），恢复所有模型的 `[Tab] Context (256K / 512K / 900K)` 切换器与 `settings.json` 自动读取；同时让 `agy acp` 无头模式（如 T3 Code）在提供方环境变量中配置 `AGY_CLI_AUTO_COMPACT_OVERRIDE=900K`（或 `900000`）时直接生效。日常使用无需包装启动器（同时保留 `AGY_CLI_AUTO_COMPACT_OVERRIDE` 作为最高优先级临时覆盖）。
+- **跨版本自适应（已实机验证 `1.5.3` / `1.5.7` / `1.5.9` / `1.5.11` / `1.5.12` / `1.5.13` / `1.5.17` / `1.5.18`）**：`1.5.14` 起上游把上下文窗口解析函数由 `store.(*Store).ContextWindow` 改名为 `store.(*Store).AutoCompactWindow`（返回 `(窗口, 来源)` 两个字符串），脚本按“函数内是否含白名单门禁”自动选中真实函数，并按指令形状家族匹配 `settings.json` 回退分支，无需硬编码地址。
 - **按模型家族自动遵循物理安全上界**：选择 `"900K"` 档位后，引擎仍会自动执行 `min(设定值, MaxTokens - MaxOutputTokens)` 保护输出预留：
   - `Gemini 4 Argon` / `Gemini 3.8 Flash`：**`900,000`**（物理上界 `983,040`，可经环境变量进一步释放）。
   - `Claude Opus 5.5` / `Claude Sonnet 5.5`：自动钳位至 **`872,000`**（`1,000,000 - 128,000`）。
@@ -19,9 +20,12 @@
 
 ## 版本要求与兼容性
 
-- **当前 `main` 分支适用范围**：`antigravity-cli >= 1.5.7`（Linux x86-64；以 `1.5.7` 为锚点验证，后续兼容版本如 `1.5.12`–`1.5.14` 可配合 `--allow-unknown` 直接动态定位并修补；`model-gate` 与 `acp-override` 采用调用指令符号锚定，可跨栈槽与跳转宽度变动自动适配）。
+- **当前 `main` 分支适用范围**：`antigravity-cli >= 1.5.3`（Linux x86-64）。已在 `1.5.3` / `1.5.7` / `1.5.9` / `1.5.11` / `1.5.12` / `1.5.13` / `1.5.17` / `1.5.18` 八个构建上实机验证（`sha256` 前 16 位记录于脚本 `KNOWN_BUILDS`，命中即无需 `--allow-unknown`）。
+  - **两种函数形态**：`≤ 1.5.13` 的解析函数为 `store.(*Store).ContextWindow`（返回 `string`）；`≥ 1.5.14` 改名为 `store.(*Store).AutoCompactWindow`（返回 `(window, source)` 共 4 个字），而 `ContextWindow` 退化为 `0x40` 字节的尾调用包装。脚本按“哪个符号的函数体内含白名单门禁”自动选择，不写死符号名。
+  - **`settings.json` 回退分支按指令家族匹配**：`mov disp(%rsp),%reg` + `mov 0x58(%reg),%reg` 的寻址形式（`disp32`/`rcx` 或 `disp8`/`rdx`）随版本变化，脚本内置 3 种通配布局并按返回值个数（2 或 4）决定是否补零 `%rcx`/`%rdi`。
+  - **未来版本**：若上游再次改动结构体偏移或符号名，脚本仍会以退出码 `3` 安全中止且不写入任何字节；此时先跑 `locate` 定位失配项。
 - **历史版本归档**：仓库标签 **`v1.5.5`** 保存了 `1.5.7` 之前的补丁线（适用于 `1.5.1`–`1.5.5`）。旧版环境请先执行 `git checkout v1.5.5`。
-- **实机兼容性判定**：可先运行只读 `locate --binary /usr/bin/agy` 确认 5 处必选补丁均显示 `patchable` 或 `already patched`；若未来上游改动结构体偏移导致签名失配，脚本将以退出码 `3` 安全中止，不写入任何字节。
+- **实机兼容性判定**：可先运行只读 `locate --binary /usr/bin/agy` 确认 5 处必选补丁均显示 `patchable` 或 `already patched`；同时 `locate` 会打印每处补丁实际命中的函数名（如 `store.(*Store).AutoCompactWindow +0x12b`），便于快速核对版本形态。
 - **适用对象与运行环境**：仅面向命令行工具 `/usr/bin/agy`（**非** Antigravity 桌面端 IDE）；仅需 Python 3 标准库，零第三方依赖。
 
 ---
@@ -35,7 +39,7 @@ cd ~/agy-context-unlock
 # 1. 只读检查目标函数与 5 处必选（共 6 处）补丁位点（不修改任何文件）
 python3 agy_context_unlock.py locate --binary /usr/bin/agy
 
-# 2. 原地修补 /usr/bin/agy（自动创建原版备份；1.5.7 之后的兼容版本需保留 --allow-unknown）
+# 2. 原地修补 /usr/bin/agy（自动创建/轮换原版备份；已收录构建无需 --allow-unknown）
 sudo python3 ~/agy-context-unlock/agy_context_unlock.py patch \
   --binary /usr/bin/agy --in-place --yes --allow-system --allow-unknown
 
@@ -47,6 +51,11 @@ python3 ~/agy-context-unlock/agy_context_unlock.py verify --binary /usr/bin/agy
 > **修补完成后启用高预算窗口**：
 > - **交互式 CLI（`agy`）**：启动 `agy` 后输入 `/model`，按 `Tab` 键将 `Context` 切至 `900K`（或 `512K`）并按 `Enter` 确认，即可自动写入 `~/.gemini/antigravity-cli/settings.json` 并持久生效；亦可直接在该配置文件中设置 `"contextWindow": "900K"`。
 > - **ACP 无头模式（如 T3 Code）**：`agy acp` 不读取交互式 `settings.json`，在宿主对应提供方环境变量（例如 T3 Code 的「设置 → 智能体提供方 → Antigravity → 环境 → 变量」）中添加 `AGY_CLI_AUTO_COMPACT_OVERRIDE=900K`（或 `900000`，注意 `K` 须大写）后**新开会话**（或重启宿主服务以重建 `agy acp` 子进程）即可生效；未设置该变量时保持原厂默认行为。
+
+> [!WARNING]
+> **不要直接运行“可写位置上的已修补副本”**：`agy` 自带后台自动更新器，在检测到新版本时会**覆盖同路径的二进制文件**（实测把 `/tmp` 下的已修补副本替换成了新版本，导致补丁静默失效）。安全做法只有两种：
+> 1. 原地修补 `root:root` 拥有的 `/usr/bin/agy`（普通用户运行的更新器无法改写它）；
+> 2. 使用 `install --patch`（安装后自动 `chmod 0555`）或自行 `chmod 555` 锁定副本，并在运行时设置 `AGY_CLI_DISABLE_AUTO_UPDATE=1`。
 
 ---
 
@@ -91,7 +100,7 @@ sudo python3 ~/agy-context-unlock/agy_context_unlock.py restore --binary /usr/bi
 | 命令 | 用途说明 |
 |---|---|
 | `python3 agy_context_unlock.py locate --binary /usr/bin/agy` | 纯只读检查 Go 符号表与 6 处补丁位点的可修补状态 |
-| `sudo python3 agy_context_unlock.py patch --binary /usr/bin/agy --in-place --yes --allow-system [--allow-unknown]` | 原地应用 5 处核心补丁并备份/轮换原版（加 `--dry-run` 零写入预演） |
+| `sudo python3 agy_context_unlock.py patch --binary /usr/bin/agy --in-place --yes --allow-system [--allow-unknown]` | 原地应用 5 处核心补丁并备份/轮换原版（加 `--dry-run` 零写入预演；已实机验证的构建无需 `--allow-unknown`） |
 | `python3 agy_context_unlock.py verify --binary /usr/bin/agy` | 只读校验 5 处必选补丁是否均已生效 |
 | `sudo python3 agy_context_unlock.py restore --binary /usr/bin/agy` | 从同目录 `.agy-unlock-backup` 原子还原原版二进制 |
 | `sudo python3 agy_context_unlock.py pacman-hook --script-path <绝对路径> --write <Hook路径>` | 生成并写入 Pacman `PostTransaction` 自动修补 Hook |
@@ -109,7 +118,7 @@ sudo python3 ~/agy-context-unlock/agy_context_unlock.py restore --binary /usr/bi
 |---|---|
 | **[《原理与使用指南》](docs/overview-and-guide.md)** | 面向所有读者的通俗导读：本地压缩触发流程、三种 Token 口径、`/model` 与 `settings.json` 持久化闭环、无头 ACP 模式兜底机制、不同模型家族物理上界、双通道对照与常见误区澄清 |
 | **[《CLI 命令参考、安全机制与支持契约》](docs/cli-and-support-scope.md)** | 全部子命令与选项详解、交互式与 ACP 窗口配置、原地修补 / Pacman Hook / 免 root 独立副本部署、GDB 与在线验证工具参考、退出码契约与故障排查 |
-| **[《二进制补丁与脚本实现详解》](docs/binary-patch-internals.md)** | ELF64 + Go `pclntab` 动态符号解析、`/model` 持久化写入与读取逆向、5 处核心补丁（39–42 字节）与可选补丁逐字节汇编对比，以及 `1.5.7`–`1.5.14` 兼容性与备份安全记录 |
+| **[《二进制补丁与脚本实现详解》](docs/binary-patch-internals.md)** | ELF64 + Go `pclntab` 动态符号解析、`/model` 持久化写入与读取逆向、5 处核心补丁（约 42 字节）与可选补丁逐字节汇编对比，以及 `1.5.7`→`1.5.14+` 函数改名/返回签名变更的兼容性记录 |
 | **[《技术报告：Google OAuth 原生通道》](docs/mechanism-native-oauth.md)** | 原生通道完整代码路径、`ContextWindowMetadata` 本地构造汇编、TLS 抓包键树与逐轮 Token 实测数据（`1.5.1` 原始取证记录） |
 | **[《技术报告：企业网关通道》](docs/mechanism-enterprise-gateway.md)** | `/v1beta` 企业网关与自定义模型推导链路、本地反向代理抓包、Gemini 与 DeepSeek 多模型对比实验及证据边界（`1.5.1` 原始取证记录） |
 

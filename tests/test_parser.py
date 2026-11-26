@@ -2,8 +2,8 @@
 """Offline tests for the ELF/pclntab parser and the five core patch sites.
 
 Run:  python3 -m unittest discover -s tests -v
-They are skipped automatically when /usr/bin/agy is absent or is not the
-verified 1.5.7 x86-64 build.
+They are skipped automatically when /usr/bin/agy is absent or is not one of the
+locally verified x86-64 builds (see ``unlock.KNOWN_BUILDS``).
 """
 
 from __future__ import annotations
@@ -21,11 +21,12 @@ import agy_context_unlock as unlock  # noqa: E402
 
 BIN = Path("/usr/bin/agy")
 HAS_BIN = BIN.exists()
-SHA_PREFIX = "5df525a2d6908989"
-IS_TARGET = HAS_BIN and hashlib.sha256(BIN.read_bytes()).hexdigest().startswith(SHA_PREFIX)
+SHA256 = hashlib.sha256(BIN.read_bytes()).hexdigest() if HAS_BIN else ""
+BUILD = unlock.identify_build(SHA256) if HAS_BIN else None
+IS_TARGET = BUILD is not None
 
 
-@unittest.skipUnless(IS_TARGET, "target agy 1.5.7 x86-64 not present")
+@unittest.skipUnless(IS_TARGET, "no locally verified agy build present")
 class TestTargetBinary(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -37,25 +38,18 @@ class TestTargetBinary(unittest.TestCase):
         self.assertEqual(self.elf.machine, 0x3E)  # x86-64
         text = self.elf.section(".text")
         self.assertIsNotNone(text)
-        self.assertEqual(text.addr, 0x6EEF000)
-        self.assertEqual(text.offset, 0x6EEF000)
+        self.assertEqual(text.addr, text.offset)
+        # Go entry stubs sit 0x80 bytes into .text.
+        self.assertEqual(self.syms.text_base, text.addr + 0x80)
 
-    def test_pclntab_and_text_base(self):
-        self.assertEqual(self.syms.pclntab_off, 0x17652A0)
+    def test_pclntab(self):
         self.assertEqual(self.syms.min_lc, 1)
-        self.assertEqual(self.syms.nfunc, 187711)
-        self.assertEqual(self.syms.text_base, 0x6EEF080)
+        self.assertGreater(self.syms.nfunc, 100_000)
+        self.assertEqual(len({f.va for f in self.syms.funcs.values()}), len(self.syms.funcs))
 
     def test_anchor_symbols(self):
-        anchors = {
-            "model.SelectorModel.offersContextWindow": 0xA6A03C0,
-            "store.(*Store).ContextWindowChoice": 0xA3FDEA0,
-            "store.(*Store).ContextWindow": 0xA3FDEE0,
-            "store.AutoCompactOverrideSpec": 0xA3FDC00,
-            "backend.ContextWindow.MaxTokenLimit": 0xA0789E0,
-            "backend.(*ServerBackend).buildCascadeConfigInternal": 0xA08C3A0,
-            "utils.GetCheckpointConfig": 0x84F5CE0,
-        }
+        anchors = unlock.ANCHORS_BY_BUILD[SHA256[:16]]
+        self.assertTrue(anchors, "anchor table must not be empty")
         for name, va in anchors.items():
             with self.subTest(name=name):
                 self.assertEqual(self.syms.find(name).va, va)
@@ -63,34 +57,33 @@ class TestTargetBinary(unittest.TestCase):
     def test_patch_bytes_are_exact_and_unique(self):
         u = unlock.Unlocker(BIN)
         before = bytes(u.data)
-        for p in [x for x in unlock.PATCHES if not x.optional]:
-            state, off, _va, _new = u.inspect_patch(p)
+        required = [x for x in unlock.PATCHES if not x.optional]
+        for p in required:
+            state, off, va, new = u.inspect_patch(p)
             self.assertEqual(state, "clean", p.key)
-            if p.key == "acp-override":
-                self.assertEqual(before[off + 5:off + 5 + len(p.old)], p.old, p.key)
-            else:
-                self.assertEqual(before[off:off + len(p.old)], p.old, p.key)
+            fn = u._patch_fn(p)
+            self.assertTrue(fn.va <= va < fn.end, p.key)
+            self.assertNotEqual(before[off:off + len(new)], new, p.key)
+        for p in required:
+            self.assertEqual(u.apply(p).status, "applied", p.key)
+        self.assertTrue(u.is_patched())
 
     def test_patch_changes_only_expected_bytes(self):
         u = unlock.Unlocker(BIN)
         before = bytes(u.data)
-        for p in [x for x in unlock.PATCHES if not x.optional]:
+        required = [x for x in unlock.PATCHES if not x.optional]
+        expected = set()
+        for p in required:
+            _state, off, _va, new = u.inspect_patch(p)
+            for i, byte in enumerate(new):
+                if before[off + i] != byte:
+                    expected.add(off + i)
+        for p in required:
             u.apply(p)
         after = bytes(u.data)
         diff = {i for i in range(len(before)) if before[i] != after[i]}
-        expected = set()
-        # exact expected diff: derive from the five known core patch sites (42 bytes total)
-        sites = {
-            "ui-selector": (0xA6A03C0, range(0, 6)),
-            "store-gate": (0xA3FDFA9, (1, 3, 4, 5, 6)),
-            "settings-window": (0xA3FE005, (2, 8, 9, 10, 11, 12, 13, 14)),
-            "model-gate": (0xA08D0CB, (0,)),
-            "acp-override": (0xA08D088, range(0, 22)),
-        }
-        for name, (base, rels) in sites.items():
-            for r in rels:
-                expected.add(base + r)
         self.assertEqual(diff, expected)
+        # 42 bytes total on every 1.5.x layout verified so far.
         self.assertEqual(len(diff), 42)
 
     def test_cli_locate_json(self):
@@ -99,7 +92,7 @@ class TestTargetBinary(unittest.TestCase):
             capture_output=True, text=True,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("0x6eef080", r.stdout)
+        self.assertIn(f"{self.syms.text_base:#x}", r.stdout)
         self.assertIn("pclntab", r.stdout)
 
     def test_verify_clean_binary_fails(self):

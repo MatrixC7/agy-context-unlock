@@ -1,8 +1,8 @@
 # 二进制补丁与脚本实现详解（`agy_context_unlock.py`）
 
-> 本文档面向开发者、系统管理员与逆向工程研究人员，详细说明 `agy_context_unlock.py`（当前版本 `v2.2.0`）的内部实现原理、Go 1.18+ 符号表动态定位算法、5 处核心补丁（`1.5.7` 锚点共 42 字节，`1.5.14+` 为 39 字节）的 x86-64 反汇编前后对比，以及 `/model` 持久化闭环与无头 `agy acp` 环境变量兜底机制。
+> 本文档面向开发者、系统管理员与逆向工程研究人员，详细说明 `agy_context_unlock.py`（当前版本 `v2.3.0`）的内部实现原理、Go 1.18+ 符号表动态定位算法、5 处核心补丁（约 42 字节）的 x86-64 反汇编前后对比，以及 `/model` 持久化闭环与无头 `agy acp` 环境变量兜底机制。
 >
-> 当前文档的锚点地址、哈希与反汇编示例以 **`antigravity-cli` 1.5.7**（Linux x86-64，`SHA256: 5df525a2d6908989c57b897723caea66e00d7c4d2e24411f91ad306989574642`）为准；`model-gate` 与 `acp-override` 采用调用指令符号锚定，已实测兼容至 `1.5.13`–`1.5.14+`；1.5.7 更新前的补丁线保存在标签 **`v1.5.5`**。配套文档导航：
+> 文档同时给出 **`1.5.7`**（旧形态锚点，`SHA256: 5df525a2d6908989…`）与 **`1.5.17` / `1.5.18`**（新形态锚点，`SHA256: f3f384bd2c15a74a…` / `7c96ad8c944c1a8d…`）两套地址；已实机验证 `1.5.3`、`1.5.7`、`1.5.9`、`1.5.11`、`1.5.12`、`1.5.13`、`1.5.17`、`1.5.18` 共 8 个构建。`1.5.7` 之前的补丁线保存在标签 **`v1.5.5`**。配套文档导航：
 > - 通俗概念导读与双通道差异见 [《原理与使用指南》（`overview-and-guide.md`）](overview-and-guide.md)
 > - 全部命令选项、部署方式、验证工具与支持契约见 [《CLI 命令参考、安全机制与支持契约》（`cli-and-support-scope.md`）](cli-and-support-scope.md)
 > - 双通道原始取证报告见 [《Google OAuth 原生通道技术报告》（`mechanism-native-oauth.md`）](mechanism-native-oauth.md) 与 [《企业网关通道技术报告》（`mechanism-enterprise-gateway.md`）](mechanism-enterprise-gateway.md)
@@ -67,6 +67,21 @@
 | `backend.ContextWindow.MaxTokenLimit` | `0xa0789e0` | `0xa078a60` | 将 `"900K"` / `"512K"` / `"900000"` 解析为整数 Token 上限 |
 | `backend.(*ServerBackend).buildCascadeConfigInternal` | `0xa08c3a0` | `0xa08d180` | 将上下文窗口上限写入 `CheckpointConfig.MaxTokenLimit` |
 | `utils.GetCheckpointConfig` | `0x84f5ce0` | `0x84f6220` | 推导模型默认 Checkpoint 配置（含 `256000` 兜底钳位） |
+
+同一组锚点在 **`1.5.17` / `1.5.18`**（`1.5.14` 重构后的新形态）中如下。注意解析函数已改名为 `AutoCompactWindow`，`ContextWindow` 只剩一个 `0x40` 字节的尾调用包装：
+
+| 符号后缀 | `1.5.17` VA | 函数大小 | 说明 |
+|---|---:|---:|---|
+| `model.SelectorModel.offersContextWindow` | `0xb1e6b80` | `0x220` | 未变职责 |
+| `store.(*Store).ContextWindowChoice` | `0xaf29a60` | `0x40` | 改为读取 `cliSetting.ContextWindow` 的 `+0x78` / `+0x80`（1.5.7 为 `+0x70` / `+0x78`） |
+| `store.(*Store).AutoCompactWindow` | `0xaf29aa0` | `0x1c0` | **新**：真正的解析体，含白名单门禁与 `settings.json` 回退分支 |
+| `store.(*Store).ContextWindow` | `0xaf29c60` | `0x40` | 退化为 `call AutoCompactWindow; leave; ret`，二进制内无调用者 |
+| `store.AutoCompactOverrideSpec` | `0xaf28c80` | `0x40` | 未变职责 |
+| `backend.ContextWindow.MaxTokenLimit` | `0xa014140` | `0x80` | 将 `"900K"` / `"512K"` / `"900000"` 解析为整数 Token 上限 |
+| `backend.(*ServerBackend).buildCascadeConfigInternal` | `0xa028fa0` | `0xe00` | 未变职责 |
+| `utils.GetCheckpointConfig` | `0x8bbd6e0` | `0x540` | 未变职责 |
+
+> 以上地址同时被脚本内置为 `ANCHORS_BY_BUILD` 自检表（按 `sha256[:16]` 索引），`self-test` 会逐一比对；对本表未收录的构建，自检自动降级为“仅做结构校验”，不会误报失败。
 
 ---
 
@@ -133,9 +148,11 @@
 
 ---
 
-## 4. 五个核心补丁（`1.5.7` 锚点 42 字节；`1.5.14+` 39 字节）逐字节详解
+## 4. 五个核心补丁（`1.5.7` 锚点约 42 字节；`1.5.14+` 为 42–43 字节）逐字节详解
 
-为了将交互式配置读取链与无头 ACP 环境变量兜底链全部打通，`agy_context_unlock.py` 定义了 5 个必选补丁（在 `1.5.7`–`1.5.13` 上共修改 **42 字节**，在 `1.5.14+` 上因 `acp-override` 槽位缩为 19 字节而共修改 **39 字节**）与 1 个可选补丁。
+为了将交互式配置读取链与无头 ACP 环境变量兜底链全部打通，`agy_context_unlock.py` 定义了 5 个必选补丁与 1 个可选补丁。总改动字节数取决于各版本指令字节的重合程度（`1.5.17` 为 **42 字节**、`1.5.18` 为 **43 字节**），脚本自检按“实际逐字节差异”统计，不写死常数。
+
+> **地址标注约定**：下文以 `1.5.7` 的反汇编为例（便于与历史报告对照），并在需要时并列给出 `1.5.17` 的对应形态。两套布局的差异集中在补丁 2/3 的「`1.5.14+` 形态」说明中。
 
 ### 补丁 1：`ui-selector`（修改 6 字节）
 
@@ -171,6 +188,7 @@
     a3fdfb0: 48 85 c0                test   %rax,%rax
     a3fdfb3: 7c 3d                   jl     a3fdff2
   ```
+- **`1.5.14+` 形态**：11 字节门禁指令完全不变，只是所在函数变为 `store.(*Store).AutoCompactWindow`（`1.5.17` 中为 `0xaf29bcb`，函数内偏移 `+0x12b`）。脚本通过“哪个候选符号的函数体内含该门禁签名”自动选中函数，因此无需改动补丁字节。
 
 ### 补丁 3：`settings-window`（匹配 14 字节，实际修改 8 字节）
 
@@ -197,6 +215,26 @@
     a3fe012: c9                      leave
     a3fe013: c3                      ret
   ```
+- **`1.5.14+` 形态（关键差异）**：重构后该分支的寻址形式与返回签名都变了，因此生成代码必须跟着变。
+
+  ```text
+  修改前（1.5.17，store.(*Store).AutoCompactWindow +0x137 = 0xaf29bd7）:
+    af29bd7: 48 8b 54 24 70        mov    0x70(%rsp),%rdx      # Store 指针
+    af29bdc: 48 8b 52 58           mov    0x58(%rdx),%rdx      # s.featureProvider
+
+  修改后（16 字节）:
+    af29bd7: 48 8b 44 24 70        mov    0x70(%rsp),%rax
+    af29bdc: e8 7f fe ff ff        call   af29a60 <store.(*Store).ContextWindowChoice>
+    af29be1: 31 c9                 xor    %ecx,%ecx            # 第 3 个返回值（来源串 ptr）
+    af29be3: 31 ff                 xor    %edi,%edi            # 第 4 个返回值（来源串 len）
+    af29be5: c9                    leave
+    af29be6: c3                    ret
+  ```
+
+  - **为什么要多补 4 个字节**：`AutoCompactWindow` 的签名是 `(window string, source string)`，即 **4 个返回字**（`%rax/%rbx` 与 `%rcx/%rdi`）。空路径的原厂代码是 `xor %eax,%eax; xor %ebx,%ebx; mov %eax,%ecx; mov %ebx,%edi`，因此注入的出口必须把 `%rcx`/`%rdi` 清零，否则调用方（如 `model.ContextModel.collectStats`）会把残留寄存器当成第二个字符串指针/长度。
+  - **如何判定返回字个数**：脚本读取门禁的 `jl` 目标块——`31 c0 31 db c9 c3` 判定为 2 字（`≤1.5.13`），`31 c0 31 db 89 c1 89 df c9 c3` 判定为 4 字（`1.5.14+`），并以函数名是否以 `AutoCompactWindow` 结尾作为兜底判据。
+  - **寻址形式自适应**：脚本按通配布局匹配 `mov disp(%rsp),%reg` + `mov 0x58(%reg),%reg`，把 ModRM 的 `reg` 字段清零改成 `%rax`，因此 `disp32`（8 字节指令）与 `disp8`（5 字节指令）两种形态都能直接复用。
+  - **不覆盖共享返回块**：`1.5.7` 的空返回块位于分支之前，`1.5.14+` 位于分支之后（`0xaf29bf8`）；脚本会校验注入长度不侵入该块，否则安全中止。
 
 ### 补丁 4：`model-gate`（符号锚定 4 字节，实际修改 1 字节）
 

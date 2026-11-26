@@ -1,37 +1,54 @@
 #!/usr/bin/env python3
 """agy-context-unlock: unlock >256K context window in antigravity-cli (agy).
 
-Verified mechanism (antigravity-cli 1.5.7, Linux x86-64)
---------------------------------------------------------
+Verified mechanism (antigravity-cli 1.5.17 / 1.5.18, Linux x86-64)
+---------------------------------------------------------
 1. Context auto-compaction (checkpointing) in ``agy`` is triggered **locally by
    the CLI client** (``checkpoint.shouldCheckpoint`` /
    ``checkpoint.MaybeCreateCheckpoint``), not enforced as a 256K hard cap by the
    upstream model API on main generation requests.  When the local token budget
    is reached, ``agy`` sends a separate continuation-summary request, records a
    local ``type=23`` checkpoint step in SQLite, and replaces older history.
-2. In unpatched ``agy`` 1.5.7, ``~/.gemini/antigravity-cli/settings.json``'s
-   ``"contextWindow": "900K"`` does not take effect on the default path, and
-   ``AGY_CLI_AUTO_COMPACT_OVERRIDE`` only works for ``"Gemini 4 Argon"`` due to
-   a hardcoded one-model whitelist in ``store.(*Store).ContextWindow``.
+2. In unpatched ``agy``, ``~/.gemini/antigravity-cli/settings.json``'s
+   ``"contextWindow": "900K"`` does not take effect on the default path, because
+   the fallback branch that reads it is gated behind an internal
+   ``types.FeatureFlagReader`` provider that is always nil in public builds.
+   The whitelist gate in front of it also only accepts ``"Gemini 4 Argon"``.
 
-What the five core binary patches do (39-42 bytes total; 42 on 1.5.7)
----------------------------------------------------------------------
+Supported layouts
+-----------------
+``1.5.1`` .. ``1.5.13``
+    The whole resolver is ``store.(*Store).ContextWindow`` and returns a single
+    string.  The ``featureProvider`` load is ``mov 0xNNN(%rsp),%rcx`` followed by
+    ``mov 0x58(%rcx),%rcx`` (``0xb8`` on ``1.5.1``..``1.5.5``).
+``1.5.14`` .. ``1.5.17+``
+    The body was renamed to ``store.(*Store).AutoCompactWindow`` and now returns
+    ``(window, source)`` -- four words -- while ``store.(*Store).ContextWindow``
+    is a 0x40-byte wrapper that tail-calls it.  The fallback branch is
+    ``mov 0x70(%rsp),%rdx`` + ``mov 0x58(%rdx),%rdx``, so the replacement also
+    has to zero the second pair of return registers (``%rcx``/``%rdi``).
+Both are located symbolically (see ``STORE_WINDOW_SYMBOLS`` and
+``SETTINGS_WINDOW_LAYOUTS``), never by hardcoded addresses.
+
+What the five core binary patches do (~42 bytes total)
+------------------------------------------------------
 1. ``ui-selector`` (``model.SelectorModel.offersContextWindow``, 6 bytes):
    Forces ``offersContextWindow()`` to return ``true`` so the Context selector
    (256K / 512K / 900K) is visible in ``/model`` for every model.
-2. ``store.(*Store).ContextWindow`` (``store-gate``, 5 bytes):
+2. ``store-gate`` (``store.(*Store).ContextWindow`` / ``AutoCompactWindow``, 5 bytes):
    Replaces the whitelist-miss ``mov $-1, %rax`` with ``xor %rax, %rax`` + NOPs
    so every native Gemini and enterprise-gateway (``<gateway>/<model>``) custom
    model passes the gate.
-3. ``settings-window`` (``store.(*Store).ContextWindow``, 8 bytes):
+3. ``settings-window`` (same function, 15 bytes on ``<=1.5.13`` / 16 on ``1.5.14+``):
    Wires the post-env fallback branch to call
    ``store.(*Store).ContextWindowChoice``, which reads and validates
    ``settings.json``'s ``"contextWindow"`` (``"256K"`` / ``"512K"`` /
    ``"900K"``).  With this patch, ``settings.json`` and interactive ``/model``
    selections work directly without requiring environment variables, while
    ``AGY_CLI_AUTO_COMPACT_OVERRIDE`` retains highest priority when set.
-   In 1.5.7 the ``featureProvider`` field moved from ``+0xb8`` to ``+0x58``,
-   so the 14-byte instruction signature is version-specific (see ``PATCHES``).
+   The instruction shape of this branch differs per release family, so the
+   patcher matches one of several wildcarded layouts instead of one fixed
+   byte string (see ``SETTINGS_WINDOW_LAYOUTS``).
 4. ``model-gate`` (``backend.(*ServerBackend).buildCascadeConfigInternal``, 1 byte):
    Changes the ``proto.Equal`` conditional jump (``jne`` -> ``jmp``) so any
    non-zero resolved context window is unconditionally written into
@@ -67,9 +84,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-PROJECT_VERSION = "2.2.0"
-TARGET_VERSION = "1.5.7"
-TARGET_SHA256_PREFIX = "5df525a2d6908989"
+PROJECT_VERSION = "2.3.0"
+TARGET_VERSION = "1.5.18"
+TARGET_SHA256_PREFIX = "7c96ad8c944c1a8d"
+# Builds whose layouts were verified locally.  Each entry is
+# ``sha256_prefix -> agy version``; ``--allow-unknown`` is only needed for
+# binaries that match none of them (the symbolic anchors still apply).
+KNOWN_BUILDS: Dict[str, str] = {
+    "7c96ad8c944c1a8d": "1.5.18",
+    "f3f384bd2c15a74a": "1.5.17",
+    "c3fd2c848abf88a2": "1.5.13",
+    "94104f028e6962fa": "1.5.12",
+    "01b063665007b709": "1.5.11",
+    "39816d49d5ab9222": "1.5.9",
+    "5df525a2d6908989": "1.5.7",
+    "7ca212748ca0dfda": "1.5.3",
+}
 GO_MAGICS = (0xFFFFFFF1, 0xFFFFFFF0)  # Go 1.18+ primary layout; 0xFFFFFFF0 kept as constant
 DEFAULT_WINDOW = 900_000
 MAX_WINDOW = 1_000_000
@@ -80,6 +110,19 @@ PF_X = 0x1
 
 class BinaryError(RuntimeError):
     pass
+
+
+def short_symbol(name: str) -> str:
+    """``google3/.../store/store.(*Store).AutoCompactWindow`` -> ``store.(*Store).AutoCompactWindow``."""
+    return name.rsplit("/", 1)[-1]
+
+
+def identify_build(sha256: str) -> Optional[str]:
+    """Return the agy version whose layout table matches ``sha256``, if known."""
+    for prefix, version in KNOWN_BUILDS.items():
+        if sha256.startswith(prefix):
+            return version
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +422,150 @@ class Patch:
     occurrence: int = 0  # 0 = must be exactly one
 
 
+# ---------------------------------------------------------------------------
+# store.(*Store) context-window layouts (version families)
+# ---------------------------------------------------------------------------
+
+# The whitelist gate and the ``settings.json`` fallback live in the function
+# that resolves the auto-compact window.  That function was renamed in the
+# 1.5.14 refactor, so both names are probed (newest first) and the one that
+# actually contains the gate signature wins.
+STORE_WINDOW_SYMBOLS: Tuple[str, ...] = (
+    "store.(*Store).AutoCompactWindow",  # 1.5.14+
+    "store.(*Store).ContextWindow",      # 1.5.1 .. 1.5.13
+)
+
+# ``mov $-1,%rax; test %rax,%rax; jl <empty>`` -- the one-model whitelist miss.
+GATE_OLD = bytes.fromhex("48 c7 c0 ff ff ff ff 48 85 c0 7c")
+GATE_NEW = bytes.fromhex("48 31 c0 90 90 90 90 48 85 c0 7c")
+
+
+def wildcard_pattern(spec: str) -> Tuple[Optional[int], ...]:
+    """``"48 8b 54 24 ??"`` -> (0x48, 0x8b, 0x54, 0x24, None); None matches any byte."""
+    return tuple(None if tok == "??" else int(tok, 16) for tok in spec.split())
+
+
+def match_pattern(blob: bytes, pattern: Tuple[Optional[int], ...], start: int = 0) -> List[int]:
+    """Return every offset in ``blob`` where ``pattern`` matches."""
+    n = len(pattern)
+    hits: List[int] = []
+    for i in range(start, len(blob) - n + 1):
+        for j, want in enumerate(pattern):
+            if want is not None and blob[i + j] != want:
+                break
+        else:
+            hits.append(i)
+    return hits
+
+
+@dataclass(frozen=True)
+class SettingsWindowLayout:
+    """Instruction shape of the ``no env override -> feature flag`` fallback."""
+
+    label: str
+    pattern: Tuple[Optional[int], ...]
+    mov_len: int  # length of the ``mov disp(%rsp),%reg`` that loads the Store
+
+
+SETTINGS_WINDOW_LAYOUTS: Tuple[SettingsWindowLayout, ...] = (
+    # 1.5.14+  (store.(*Store).AutoCompactWindow)
+    #   mov 0x70(%rsp),%rdx ; mov 0x58(%rdx),%rdx
+    SettingsWindowLayout("1.5.14+", wildcard_pattern("48 8b 54 24 ?? 48 8b 52 ??"), 5),
+    # 1.5.7 .. 1.5.13  (store.(*Store).ContextWindow)
+    #   mov 0x108(%rsp),%rcx ; mov 0x58(%rcx),%rcx
+    SettingsWindowLayout("1.5.7-1.5.13", wildcard_pattern("48 8b 8c 24 ?? ?? ?? ?? 48 8b 49 ??"), 8),
+    # 1.5.1 .. 1.5.5  (featureProvider sat at +0xb8)
+    #   mov 0x108(%rsp),%rcx ; mov 0xb8(%rcx),%rcx
+    SettingsWindowLayout("1.5.1-1.5.5", wildcard_pattern("48 8b 8c 24 ?? ?? ?? ?? 48 8b 89 ?? ?? ??"), 8),
+)
+
+
+# ---------------------------------------------------------------------------
+# Verified anchor addresses (self-test)
+# ---------------------------------------------------------------------------
+
+# Keyed by the first 16 hex chars of the binary's SHA256.  ``self-test`` only
+# compares addresses for builds listed here; for any other build it falls back
+# to the structural checks (patch signatures + byte accounting), which are what
+# actually matter for correctness.
+ANCHORS_BY_BUILD: Dict[str, Dict[str, int]] = {
+    "7c96ad8c944c1a8d": {  # agy 1.5.18
+        "model.SelectorModel.offersContextWindow": 0x0b394ce0,
+        "store.(*Store).ContextWindowChoice": 0x0b0d79a0,
+        "store.(*Store).AutoCompactWindow": 0x0b0d79e0,
+        "store.(*Store).ContextWindow": 0x0b0d7ba0,
+        "store.AutoCompactOverrideSpec": 0x0b0d6bc0,
+        "backend.ContextWindow.MaxTokenLimit": 0x0a16afa0,
+        "backend.(*ServerBackend).buildCascadeConfigInternal": 0x0a17fde0,
+        "utils.GetCheckpointConfig": 0x08cdd280,
+    },
+    "f3f384bd2c15a74a": {  # agy 1.5.17
+        "model.SelectorModel.offersContextWindow": 0x0b1e6b80,
+        "store.(*Store).ContextWindowChoice": 0x0af29a60,
+        "store.(*Store).AutoCompactWindow": 0x0af29aa0,
+        "store.(*Store).ContextWindow": 0x0af29c60,
+        "store.AutoCompactOverrideSpec": 0x0af28c80,
+        "backend.ContextWindow.MaxTokenLimit": 0x0a014140,
+        "backend.(*ServerBackend).buildCascadeConfigInternal": 0x0a028fa0,
+        "utils.GetCheckpointConfig": 0x08bbd6e0,
+    },
+    "c3fd2c848abf88a2": {  # agy 1.5.13
+        "model.SelectorModel.offersContextWindow": 0x0abdebc0,
+        "store.(*Store).ContextWindowChoice": 0x0a93a440,
+        "store.(*Store).ContextWindow": 0x0a93a480,
+        "store.AutoCompactOverrideSpec": 0x0a93a1a0,
+        "backend.ContextWindow.MaxTokenLimit": 0x099559a0,
+        "backend.(*ServerBackend).buildCascadeConfigInternal": 0x09969740,
+        "utils.GetCheckpointConfig": 0x088b9740,
+    },
+    "94104f028e6962fa": {  # agy 1.5.12
+        "model.SelectorModel.offersContextWindow": 0x0ab57f60,
+        "store.(*Store).ContextWindowChoice": 0x0a8b4e00,
+        "store.(*Store).ContextWindow": 0x0a8b4e40,
+        "store.AutoCompactOverrideSpec": 0x0a8b4b60,
+        "backend.ContextWindow.MaxTokenLimit": 0x09a02f60,
+        "backend.(*ServerBackend).buildCascadeConfigInternal": 0x09a16b60,
+        "utils.GetCheckpointConfig": 0x0886d780,
+    },
+    "01b063665007b709": {  # agy 1.5.11
+        "model.SelectorModel.offersContextWindow": 0x0aadc5e0,
+        "store.(*Store).ContextWindowChoice": 0x0a839aa0,
+        "store.(*Store).ContextWindow": 0x0a839ae0,
+        "store.AutoCompactOverrideSpec": 0x0a839800,
+        "backend.ContextWindow.MaxTokenLimit": 0x09995620,
+        "backend.(*ServerBackend).buildCascadeConfigInternal": 0x099a9220,
+        "utils.GetCheckpointConfig": 0x088152a0,
+    },
+    "39816d49d5ab9222": {  # agy 1.5.9
+        "model.SelectorModel.offersContextWindow": 0x0a843fa0,
+        "store.(*Store).ContextWindowChoice": 0x0a59d820,
+        "store.(*Store).ContextWindow": 0x0a59d860,
+        "store.AutoCompactOverrideSpec": 0x0a59d580,
+        "backend.ContextWindow.MaxTokenLimit": 0x0a2142a0,
+        "backend.(*ServerBackend).buildCascadeConfigInternal": 0x0a227d00,
+        "utils.GetCheckpointConfig": 0x0860ac60,
+    },
+    "5df525a2d6908989": {  # agy 1.5.7
+        "model.SelectorModel.offersContextWindow": 0x0a6a03c0,
+        "store.(*Store).ContextWindowChoice": 0x0a3fdea0,
+        "store.(*Store).ContextWindow": 0x0a3fdee0,
+        "store.AutoCompactOverrideSpec": 0x0a3fdc00,
+        "backend.ContextWindow.MaxTokenLimit": 0x0a0789e0,
+        "backend.(*ServerBackend).buildCascadeConfigInternal": 0x0a08c3a0,
+        "utils.GetCheckpointConfig": 0x084f5ce0,
+    },
+    "7ca212748ca0dfda": {  # agy 1.5.3
+        "model.SelectorModel.offersContextWindow": 0x0a381480,
+        "store.(*Store).ContextWindowChoice": 0x0a12c2a0,
+        "store.(*Store).ContextWindow": 0x0a12c2e0,
+        "store.AutoCompactOverrideSpec": 0x0a12c000,
+        "backend.ContextWindow.MaxTokenLimit": 0x09d64e20,
+        "backend.(*ServerBackend).buildCascadeConfigInternal": 0x09d783c0,
+        "utils.GetCheckpointConfig": 0x08390860,
+    },
+}
+
+
 PATCHES: List[Patch] = [
     Patch(
         key="ui-selector",
@@ -389,14 +576,17 @@ PATCHES: List[Patch] = [
     ),
     Patch(
         key="store-gate",
-        symbol="store.(*Store).ContextWindow",
-        old=bytes.fromhex("48 c7 c0 ff ff ff ff 48 85 c0 7c"),
-        new=bytes.fromhex("48 31 c0 90 90 90 90 48 85 c0 7c"),
+        # Resolved dynamically: AutoCompactWindow on 1.5.14+, ContextWindow before.
+        symbol="store.(*Store).AutoCompactWindow|store.(*Store).ContextWindow",
+        old=GATE_OLD,
+        new=GATE_NEW,
         description="Context override: bypass the one-model whitelist gate",
     ),
     Patch(
         key="settings-window",
-        symbol="store.(*Store).ContextWindow",
+        # Signature is version-specific (see SETTINGS_WINDOW_LAYOUTS); the bytes
+        # below are only documentation for the 1.5.7 layout family.
+        symbol="store.(*Store).AutoCompactWindow|store.(*Store).ContextWindow",
         old=bytes.fromhex("48 8b 8c 24 08 01 00 00 48 8b 49 58"),
         new=bytes.fromhex("48 8b 84 24 08 01 00 00 e8 8e fe ff ff c9 c3"),
         description="Context override: fall back to settings.json contextWindow (ContextWindowChoice)",
@@ -446,7 +636,8 @@ class Unlocker:
         self.path = path
         self.data = bytearray(path.read_bytes())
         self.sha256 = hashlib.sha256(self.data).hexdigest()
-        self.is_target = self.sha256.startswith(TARGET_SHA256_PREFIX)
+        self.build_version = identify_build(self.sha256)
+        self.is_target = self.build_version is not None
         self.elf = ELFFile(bytes(self.data))
         self.symbols = GoSymbols(self.elf)
         self.text_sec = self.elf.section(".text")
@@ -529,17 +720,144 @@ class Unlocker:
 
     def _resolve_patch_new_bytes(self, p: Patch, site_va: int) -> bytes:
         """Compute dynamic target-relative machine code for call/branch patches."""
-        if p.key == "settings-window":
-            choice_fn = self.symbols.find("store.(*Store).ContextWindowChoice")
-            call_next_va = site_va + 8 + 5  # mov (8B) + call rel32 (5B)
-            rel = choice_fn.va - call_next_va
-            if not (-1 << 31 <= rel < 1 << 31):
-                raise BinaryError(f"settings-window: ContextWindowChoice out of rel32 range ({rel:#x})")
-            return bytes.fromhex("48 8b 84 24 08 01 00 00") + b"\xe8" + struct.pack("<i", rel) + b"\xc9\xc3"
-        if p.key in ("model-gate", "acp-override"):
+        if p.key in ("model-gate", "acp-override", "settings-window"):
             _state, _off, _va, new_bytes = self.inspect_patch(p)
             return new_bytes
         return p.new
+
+    # -- store.(*Store) context-window helpers -----------------------------
+    def _patch_fn(self, p: Patch) -> GoFunc:
+        """Resolve the function a patch lives in (symbols move between releases)."""
+        if p.key in ("store-gate", "settings-window"):
+            return self._store_window_fn()
+        return self.symbols.find(p.symbol)
+
+    def patch_symbol(self, p: Patch) -> str:
+        """Name to display for a patch target (resolved, not the static hint)."""
+        if p.key in ("store-gate", "settings-window"):
+            try:
+                return short_symbol(self._store_window_fn().name)
+            except BinaryError:
+                return "store.(*Store).ContextWindow|AutoCompactWindow"
+        return p.symbol
+
+    def _store_window_fn(self) -> GoFunc:
+        """Return the function holding the one-model whitelist gate."""
+        tried = []
+        for name in STORE_WINDOW_SYMBOLS:
+            try:
+                fn = self.symbols.find(name)
+            except BinaryError:
+                continue
+            tried.append(name)
+            start, end = self.func_bytes(fn)
+            blob = bytes(self.data[start:end])
+            if GATE_OLD in blob or GATE_NEW in blob:
+                return fn
+        raise BinaryError(
+            "store context-window gate not found in " + (", ".join(tried) or "any known symbol")
+        )
+
+    def _empty_return_target(self, fn: GoFunc, blob: bytes) -> Optional[int]:
+        """Offset of the shared ``xor eax,eax; xor ebx,ebx; ...; ret`` block."""
+        g = blob.find(GATE_OLD)
+        if g < 0:
+            g = blob.find(GATE_NEW)
+        if g < 0 or g + 12 > len(blob) or blob[g + 10] != 0x7C:
+            return None
+        target = g + 12 + struct.unpack_from("<b", blob, g + 11)[0]
+        if 0 <= target < len(blob):
+            return target
+        return None
+
+    def _store_window_return_arity(self, fn: GoFunc, blob: bytes) -> int:
+        """2 words (string) on <=1.5.13, 4 words (window + source spec) on 1.5.14+."""
+        target = self._empty_return_target(fn, blob)
+        if target is not None and target + 10 <= len(blob):
+            block = blob[target:target + 10]
+            if block[:4] == bytes.fromhex("31 c0 31 db"):
+                if block[4:6] == bytes.fromhex("c9 c3"):
+                    return 2
+                if block[4:8] == bytes.fromhex("89 c1 89 df"):
+                    return 4
+        # Fallback: the 1.5.14 refactor renamed the body to AutoCompactWindow.
+        return 4 if fn.name.endswith("AutoCompactWindow") else 2
+
+    def _find_settings_window_patched(self, fn: GoFunc, blob: bytes) -> Optional[Tuple[int, int]]:
+        """Locate an already-applied ``mov ...,%rax; call ContextWindowChoice; ...`` site."""
+        try:
+            choice_va = self.symbols.find("store.(*Store).ContextWindowChoice").va
+        except BinaryError:
+            return None
+        hits: List[Tuple[int, int]] = []
+        for i in range(0, max(0, len(blob) - 16)):
+            if blob[i] != 0x48 or blob[i + 1] != 0x8B:
+                continue
+            modrm = blob[i + 2]
+            if modrm == 0x84:    # mov disp32(%rsp),%rax
+                mov_len = 8
+            elif modrm == 0x44:  # mov disp8(%rsp),%rax
+                mov_len = 5
+            else:
+                continue
+            if blob[i + 3] != 0x24 or i + mov_len + 5 > len(blob) or blob[i + mov_len] != 0xE8:
+                continue
+            rel = struct.unpack_from("<i", blob, i + mov_len + 1)[0]
+            if fn.va + i + mov_len + 5 + rel != choice_va:
+                continue
+            tail = blob[i + mov_len + 5:]
+            if tail[:6] == bytes.fromhex("31 c9 31 ff c9 c3"):
+                hits.append((i, mov_len + 5 + 6))
+            elif tail[:2] == bytes.fromhex("c9 c3"):
+                hits.append((i, mov_len + 5 + 2))
+        if len(hits) > 1:
+            raise BinaryError(f"settings-window: multiple patched sites found in {fn.name}")
+        return hits[0] if hits else None
+
+    def _inspect_settings_window(self, fn: GoFunc, start: int, blob: bytes) -> Tuple[str, int, int, bytes]:
+        patched = self._find_settings_window_patched(fn, blob)
+        if patched is not None:
+            idx, size = patched
+            return "patched", start + idx, fn.va + idx, bytes(blob[idx:idx + size])
+
+        matches: List[Tuple[SettingsWindowLayout, int]] = []
+        for layout in SETTINGS_WINDOW_LAYOUTS:
+            for i in match_pattern(blob, layout.pattern):
+                matches.append((layout, i))
+        if not matches:
+            known = ", ".join(lay.label for lay in SETTINGS_WINDOW_LAYOUTS)
+            raise BinaryError(
+                f"settings-window: fallback branch not found in {fn.name} "
+                f"(known layouts: {known})"
+            )
+        if len(matches) > 1:
+            where = ", ".join(f"{lay.label}+0x{i:x}" for lay, i in matches)
+            raise BinaryError(f"settings-window: ambiguous fallback branch in {fn.name}: {where}")
+        layout, i = matches[0]
+
+        choice_fn = self.symbols.find("store.(*Store).ContextWindowChoice")
+        site_va = fn.va + i
+        mov = bytearray(blob[i:i + layout.mov_len])
+        mov[2] &= 0xC7  # clear the ModRM.reg field -> %rax (first return register)
+        if mov[3] != 0x24:
+            raise BinaryError(f"settings-window: unexpected addressing mode in {fn.name} ({bytes(mov).hex()})")
+        rel = choice_fn.va - (site_va + layout.mov_len + 5)
+        if not (-1 << 31 <= rel < 1 << 31):
+            raise BinaryError(f"settings-window: ContextWindowChoice out of rel32 range ({rel:#x})")
+        new_bytes = bytes(mov) + b"\xe8" + struct.pack("<i", rel)
+        if self._store_window_return_arity(fn, blob) >= 4:
+            # 1.5.14+ returns (window, source): zero the second string pair.
+            new_bytes += bytes.fromhex("31 c9 31 ff")
+        new_bytes += bytes.fromhex("c9 c3")
+
+        empty = self._empty_return_target(fn, blob)
+        if empty is not None and i < empty < i + len(new_bytes):
+            raise BinaryError(
+                f"settings-window: replacement would clobber the shared return block in {fn.name}"
+            )
+        if i + len(new_bytes) > len(blob):
+            raise BinaryError(f"settings-window: replacement exceeds function bounds in {fn.name}")
+        return "clean", start + i, site_va, new_bytes
 
     # -- helpers -----------------------------------------------------------
     def func_bytes(self, fn: GoFunc) -> Tuple[int, int]:
@@ -553,9 +871,12 @@ class Unlocker:
 
     def inspect_patch(self, p: Patch) -> Tuple[str, int, int, bytes]:
         """Return (state, file_offset, va, resolved_new_bytes) with state in {'patched', 'clean'}."""
-        fn = self.symbols.find(p.symbol)
+        fn = self._patch_fn(p)
         start, end = self.func_bytes(fn)
         blob = bytes(self.data[start:end])
+
+        if p.key == "settings-window":
+            return self._inspect_settings_window(fn, start, blob)
 
         if p.key == "model-gate":
             return self._inspect_model_gate(fn, start, blob)
@@ -596,48 +917,6 @@ class Unlocker:
                 raise BinaryError(f"acp-override: slot not followed by mov %eax, disp(%rsp)")
             new_bytes = core + b"\x90" * (slot_len - len(core))
             return "clean", start + site_idx, site_va, new_bytes
-
-        if p.key == "settings-window":
-            prefix = bytes.fromhex("48 8b 84 24 08 01 00 00 e8")
-            patched_hits = []
-            pos = 0
-            while True:
-                i = blob.find(prefix, pos)
-                if i < 0:
-                    break
-                pos = i + 1
-                if i + 15 <= len(blob):
-                    cand = self._resolve_patch_new_bytes(p, fn.va + i)
-                    if blob[i:i + 15] == cand:
-                        patched_hits.append((i, cand))
-            if len(patched_hits) == 1:
-                i, cand = patched_hits[0]
-                return "patched", start + i, fn.va + i, cand
-            if len(patched_hits) > 1:
-                raise BinaryError(f"{p.key}: multiple patched sites found in {p.symbol}")
-
-            hits = []
-            pos = 0
-            while True:
-                i = blob.find(p.old, pos)
-                if i < 0:
-                    break
-                hits.append(i)
-                pos = i + 1
-            if not hits:
-                raise BinaryError(f"{p.key}: expected bytes not found in {p.symbol}")
-            if p.occurrence == 0 and len(hits) != 1:
-                raise BinaryError(
-                    f"{p.key}: expected exactly one match of {p.old.hex()} in {p.symbol}, found {len(hits)}"
-                )
-            if p.occurrence >= len(hits):
-                raise BinaryError(f"{p.key}: occurrence {p.occurrence} not found in {p.symbol}")
-            i = hits[p.occurrence]
-            site_va = fn.va + i
-            new_bytes = self._resolve_patch_new_bytes(p, site_va)
-            if i + len(new_bytes) > len(blob):
-                raise BinaryError(f"{p.key}: replacement exceeds function bounds in {p.symbol}")
-            return "clean", start + i, site_va, new_bytes
 
         if p.new in blob:
             idx = blob.find(p.new)
@@ -710,9 +989,9 @@ def cmd_locate(args: argparse.Namespace) -> int:
     for p in PATCHES:
         try:
             state_key, off, va, _new = u.inspect_patch(p)
-            fn = u.symbols.find(p.symbol)
+            fn = u._patch_fn(p)
             state = "already patched" if state_key == "patched" else "patchable"
-            print(f"  {p.key:16s} {state:15s} {p.symbol} +0x{va - fn.va:x} (va {va:#x}, off {off:#x})")
+            print(f"  {p.key:16s} {state:15s} {u.patch_symbol(p)} +0x{va - fn.va:x} (va {va:#x}, off {off:#x})")
         except BinaryError as exc:
             print(f"  {p.key:16s} NOT FOUND      {exc}")
     if args.json:
@@ -725,7 +1004,7 @@ def cmd_locate(args: argparse.Namespace) -> int:
                 "nfunc": u.symbols.nfunc,
                 "text_base": u.symbols.text_base,
             },
-            "symbols": {p.symbol: u.symbols.find(p.symbol).va for p in PATCHES},
+            "symbols": {p.key: u._patch_fn(p).va for p in PATCHES},
         }
         print(json.dumps(out, indent=2))
     return 0
@@ -882,7 +1161,8 @@ def _verify_patched(data: bytes) -> Tuple[bool, List[str]]:
     u.path = Path("<memory>")
     u.data = bytearray(data)
     u.sha256 = hashlib.sha256(data).hexdigest()
-    u.is_target = u.sha256.startswith(TARGET_SHA256_PREFIX)
+    u.build_version = identify_build(u.sha256)
+    u.is_target = u.build_version is not None
     u.elf = ELFFile(data)
     u.symbols = GoSymbols(u.elf)
     u.text_sec = u.elf.section(".text")
@@ -914,7 +1194,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
         except BinaryError:
             applied = False
             status = "UNKNOWN"
-        print(f"  {p.key:16s} {status:8s} {p.symbol}")
+        print(f"  {p.key:16s} {status:8s} {u.patch_symbol(p)}")
         if not p.optional and not applied:
             ok = False
     print("[+] verified: required patches are present" if ok else "[-] verification failed")
@@ -939,18 +1219,20 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     syms = GoSymbols(elf)
     checks = []
 
-    anchors = {
-        "model.SelectorModel.offersContextWindow": 0xA6A03C0,
-        "store.(*Store).ContextWindowChoice": 0xA3FDEA0,
-        "store.(*Store).ContextWindow": 0xA3FDEE0,
-        "store.AutoCompactOverrideSpec": 0xA3FDC00,
-        "backend.ContextWindow.MaxTokenLimit": 0xA0789E0,
-        "backend.(*ServerBackend).buildCascadeConfigInternal": 0xA08C3A0,
-        "utils.GetCheckpointConfig": 0x84F5CE0,
-    }
-    for name, want in anchors.items():
-        got = syms.find(name).va
-        checks.append((f"symbol {name}", got == want, f"{got:#x} (want {want:#x})"))
+    sha = hashlib.sha256(data).hexdigest()
+    anchors = ANCHORS_BY_BUILD.get(sha[:16])
+    if anchors is None:
+        checks.append(
+            ("anchor table", True, f"no table for build {sha[:16]} (structural checks only)")
+        )
+    else:
+        for name, want in anchors.items():
+            try:
+                got = syms.find(name).va
+            except BinaryError:
+                checks.append((f"symbol {name}", False, "symbol missing"))
+                continue
+            checks.append((f"symbol {name}", got == want, f"{got:#x} (want {want:#x})"))
 
     u = Unlocker(path)
     before = bytes(u.data)
