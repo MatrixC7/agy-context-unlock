@@ -24,9 +24,31 @@
   - **两种函数形态**：`≤ 1.5.13` 的解析函数为 `store.(*Store).ContextWindow`（返回 `string`）；`≥ 1.5.14` 改名为 `store.(*Store).AutoCompactWindow`（返回 `(window, source)` 共 4 个字），而 `ContextWindow` 退化为 `0x40` 字节的尾调用包装。脚本按“哪个符号的函数体内含白名单门禁”自动选择，不写死符号名。
   - **`settings.json` 回退分支按指令家族匹配**：`mov disp(%rsp),%reg` + `mov 0x58(%reg),%reg` 的寻址形式（`disp32`/`rcx` 或 `disp8`/`rdx`）随版本变化，脚本内置 3 种通配布局并按返回值个数（2 或 4）决定是否补零 `%rcx`/`%rdi`。
   - **未来版本**：若上游再次改动结构体偏移或符号名，脚本仍会以退出码 `3` 安全中止且不写入任何字节；此时先跑 `locate` 定位失配项。
-- **历史版本归档**：仓库标签 **`v1.5.5`** 保存了 `1.5.7` 之前的补丁线（适用于 `1.5.1`–`1.5.5`）。旧版环境请先执行 `git checkout v1.5.5`。
 - **实机兼容性判定**：可先运行只读 `locate --binary /usr/bin/agy` 确认 5 处必选补丁均显示 `patchable` 或 `already patched`；同时 `locate` 会打印每处补丁实际命中的函数名（如 `store.(*Store).AutoCompactWindow +0x12b`），便于快速核对版本形态。
 - **适用对象与运行环境**：仅面向命令行工具 `/usr/bin/agy`（**非** Antigravity 桌面端 IDE）；仅需 Python 3 标准库，零第三方依赖。
+
+### 版本段 × 实测状态矩阵
+
+| `agy` 版本段 | 解析函数形态 | `settings-window` 指令布局 | 已实测构建 | 状态 |
+|---|---|---|---|---|
+| `1.5.1`–`1.5.5` | `store.(*Store).ContextWindow`（2 字返回） | **A1** `mov 0x108(%rsp),%rcx` + `mov 0xb8(%rcx),%rcx` | `1.5.3` | 可修补（`main` 实测 `1.5.3` 通过）；`1.5.1`/`1.5.2` 无可用样本，建议用 `v1.5.5` 标签 |
+| `1.5.6`–`1.5.13` | `store.(*Store).ContextWindow`（2 字返回） | **A2** `mov 0x108(%rsp),%rcx` + `mov 0x58(%rcx),%rcx` | `1.5.7` / `1.5.9` / `1.5.11` / `1.5.12` / `1.5.13` | 全部实测通过 |
+| `1.5.14`–`1.5.18+` | `store.(*Store).AutoCompactWindow`（4 字返回） | **B** `mov 0x70(%rsp),%rdx` + `mov 0x58(%rdx),%rdx` | `1.5.17` / `1.5.18` | 全部实测通过 |
+
+- 三段布局在同一份 `main` 中共存，脚本按“哪个候选符号的函数体内含白名单门禁 + 哪种通配布局唯一命中”自动选择，无需按版本切换分支。
+- 未实测的同段版本（如 `1.5.6` / `1.5.8` / `1.5.10` / `1.5.14`–`1.5.16`）指令形态一致，预期可直接修补；`locate` 会打印实际命中的函数与偏移，便于确认。
+- 若某个版本出现 `acp-override NOT FOUND`（旧版 `buildCascadeConfigInternal` 内没有 `call ServerBackend.ContextWindow`），可用 `--patches ui-selector,store-gate,settings-window,model-gate` 只打 4 个核心补丁，交互式 `settings.json` 闭环不受影响。
+
+### Tag 约定
+
+本仓库的 tag 表示**该补丁线已验证到的上游版本上限**（tag 之间不构成互斥区间）：
+
+| Tag | 含义 |
+|---|---|
+| `v1.5.5` | 1.5.7 之前的补丁线：`1.5.1`–`1.5.5`，不含 `acp-override` |
+| `v1.5.18` | 当前 `main` 补丁线：已验证到 `1.5.18`（覆盖 `1.5.3`–`1.5.18` 三段布局） |
+
+升级到新的上游版本并通过 `locate` + `patch` + `self-test` + GDB 验证后，在对应提交上追加一个同名 tag 即可（例如上游发布 `1.5.19` 并验证通过后打 `v1.5.19`），无需新建分支。
 
 ---
 
