@@ -281,10 +281,39 @@ python3 -B -m unittest discover -s ~/agy-context-unlock/tests -v
 |---|---|
 | 目标平台 | Linux x86-64（ELF64 小端序 Go 1.18+ PIE 二进制） |
 | 运行依赖 | Python 3 标准库（零第三方包依赖；`tools/gdb_verify.py` 另需 `gdb`，`tools/mitm_capture.py` 另需 `mitmproxy`） |
-| 当前 `main` 适配线 | `antigravity-cli >= 1.5.7`（锚点验证构建 `1.5.7`，`SHA256: 5df525a2d6908989c57b897723caea66e00d7c4d2e24411f91ad306989574642`；后续兼容构建如 `1.5.12`–`1.5.14` 可经 `--allow-unknown` 直接定位并修补，`model-gate` / `acp-override` 采用调用符号锚定） |
-| 历史版本归档 | 仓库标签 **`v1.5.5`** 保留了 `1.5.7` 结构体变动前的补丁线（适用于 `1.5.1`–`1.5.5`，`Store.featureProvider` 位于 `+0xb8`） |
+| 当前 `main` 适配线 | `antigravity-cli` 1.5.1–1.5.18（同一份脚本覆盖三段指令布局；已实机验证 `1.5.3` / `1.5.7` / `1.5.9` / `1.5.11` / `1.5.12` / `1.5.13` / `1.5.17` / `1.5.18`，明细见 README 的「版本段 × 实测状态矩阵」） |
+| 历史版本归档 | 标签 **`v1.5.5`** 保留 1.5.7 之前的补丁线（1.5.1–1.5.5，`Store.featureProvider` 位于 `+0xb8`）；标签 **`v1.5.18`** 为当前 `main` 补丁线（验证到 1.5.18） |
 
-### 4.2 退出码契约
+### 4.2 输出约定（末行即结论）
+
+所有子命令保持 `[i] / [*] / [=] / [+] / [!] / [-]` 的单行前缀风格，**最后一行给出可直接判断的结论**：
+
+| 前缀 | 含义 |
+|---|---|
+| `[i]` | 上下文信息（路径、SHA256、备份位置等） |
+| `[*]` | 正在执行的动作（逐补丁应用明细） |
+| `[=]` | 无事可做（已修补 / 未修补等中性判定） |
+| `[+]` | 成功结论 |
+| `[!]` | 告警或部分状态 |
+| `[-]` | 失败结论（含“未修改任何文件”保证） |
+
+各命令的末行形态：
+
+| 命令 / 场景 | 末行 |
+|---|---|
+| `patch` 成功 | `[+] patched <目标> (5 applied, 42 bytes)` |
+| `patch` 幂等重复执行 | `[=] unchanged <目标> (5 already present, nothing written)` |
+| `patch --dry-run` | `[+] dry run ok <目标> (5 would be applied, 42 bytes); no file written` |
+| `patch` 失败 | `[-] patch failed <目标>; binary not modified` |
+| `verify` 全部已修补 | `[+] verified: 5/5 patched` |
+| `verify` 完全未修补 | `[=] not patched: 0/5 present (run patch)` |
+| `verify` 部分修补 | `[!] partial: 1/5 patched (restore, then re-patch)` |
+| `locate` 已修补二进制 | `[i] build  : modified (patched by this tool)`（不再误报“非验证构建”） |
+| `self-test` | `[+] self-test passed` / `[-] self-test failed` |
+
+> 明细行（`PATCHED` / `clean` / `already patched` / `patchable` 等）保持原样，便于沿用既有日志过滤。
+
+### 4.3 退出码契约
 
 | 退出码 | `agy_context_unlock.py` | `verify_live.py` | `tools/gdb_verify.py` |
 |---:|---|---|---|
@@ -294,7 +323,7 @@ python3 -B -m unittest discover -s ~/agy-context-unlock/tests -v
 | `3` | 必选补丁签名在目标函数内未命中或出现歧义（未写入任何文件） | 运行日志中未找到会话 ID | — |
 | `4` | — | `agy` 子进程非零退出且未传 `--allow-failure` | — |
 
-### 4.3 常见故障排查
+### 4.4 常见故障排查
 
 - **报错 `SHA256 ... is not the verified 1.5.7 build; use --allow-unknown to override`**
   - 原因：本机 `antigravity-cli` 已升级到 `1.5.7` 之后的新小版本（如 `1.5.12`–`1.5.14`），脚本默认开启锚点哈希保护。

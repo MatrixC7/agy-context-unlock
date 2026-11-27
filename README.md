@@ -65,7 +65,7 @@ python3 agy_context_unlock.py locate --binary /usr/bin/agy
 sudo python3 ~/agy-context-unlock/agy_context_unlock.py patch \
   --binary /usr/bin/agy --in-place --yes --allow-system --allow-unknown
 
-# 3. 校验 5 处必选补丁状态（确认输出 verified: required patches are present）
+# 3. 校验 5 处必选补丁状态（末行应为 [+] verified: 5/5 patched）
 python3 ~/agy-context-unlock/agy_context_unlock.py verify --binary /usr/bin/agy
 ```
 

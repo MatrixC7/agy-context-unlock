@@ -19,14 +19,33 @@ sys.path.insert(0, str(ROOT))
 
 import agy_context_unlock as unlock  # noqa: E402
 
-BIN = Path("/usr/bin/agy")
-HAS_BIN = BIN.exists()
-SHA256 = hashlib.sha256(BIN.read_bytes()).hexdigest() if HAS_BIN else ""
-BUILD = unlock.identify_build(SHA256) if HAS_BIN else None
+def _pick_clean_target() -> tuple[Path, str]:
+    """First *unpatched* binary we ship an anchor table for.
+
+    ``/usr/bin/agy`` is patched on most installed systems (its SHA no longer
+    matches KNOWN_BUILDS), so fall back to the rotated ``.agy-unlock-backup*``
+    copies before giving up.
+    """
+    candidates = [Path("/usr/bin/agy")]
+    candidates += sorted(Path("/usr/bin").glob("agy.agy-unlock-backup*"))
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        except OSError:
+            continue
+        if unlock.identify_build(sha):
+            return candidate, sha
+    return Path("/usr/bin/agy"), ""
+
+
+BIN, SHA256 = _pick_clean_target()
+BUILD = unlock.identify_build(SHA256) if SHA256 else None
 IS_TARGET = BUILD is not None
 
 
-@unittest.skipUnless(IS_TARGET, "no locally verified agy build present")
+@unittest.skipUnless(IS_TARGET, "no locally verified, unpatched agy build present")
 class TestTargetBinary(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

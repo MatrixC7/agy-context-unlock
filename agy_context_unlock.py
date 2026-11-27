@@ -112,6 +112,13 @@ class BinaryError(RuntimeError):
     pass
 
 
+def patch_error_text(p: Patch, exc: Exception) -> str:
+    """Drop the leading ``<key>: `` that BinaryError messages already carry."""
+    msg = str(exc)
+    prefix = p.key + ": "
+    return msg[len(prefix):] if msg.startswith(prefix) else msg
+
+
 def short_symbol(name: str) -> str:
     """``google3/.../store/store.(*Store).AutoCompactWindow`` -> ``store.(*Store).AutoCompactWindow``."""
     return name.rsplit("/", 1)[-1]
@@ -629,6 +636,7 @@ class PatchResult:
     va: Optional[int] = None
     file_offset: Optional[int] = None
     detail: str = ""
+    changed_bytes: int = 0
 
 
 class Unlocker:
@@ -680,7 +688,7 @@ class Unlocker:
             if fn.va + i + 5 + rel == target.va:
                 hits.append(i)
         if len(hits) != 1:
-            raise BinaryError(f"{label}: expected 1 call to {target_sym} in {fn.name}, found {len(hits)}")
+            raise BinaryError(f"{label}: expected 1 call to {target_sym} in {short_symbol(fn.name)}, found {len(hits)}")
         return hits[0]
 
     def _inspect_model_gate(self, fn: GoFunc, start: int, blob: bytes) -> Tuple[str, int, int, bytes]:
@@ -688,7 +696,7 @@ class Unlocker:
         peq_idx = self._find_unique_call(fn, blob, "proto.Equal", "model-gate")
         site_idx = peq_idx + 5
         if site_idx + 4 > len(blob) or blob[site_idx:site_idx + 2] != b"\x84\xc0":
-            raise BinaryError(f"model-gate: expected `test %al,%al` after call proto.Equal in {fn.name}")
+            raise BinaryError(f"model-gate: expected `test %al,%al` after call proto.Equal in {short_symbol(fn.name)}")
         op = blob[site_idx + 2]
         if op not in (0x75, 0xEB):
             raise BinaryError(f"model-gate: expected jne/jmp after `test %al,%al` (got {op:#x})")
@@ -755,7 +763,7 @@ class Unlocker:
             if GATE_OLD in blob or GATE_NEW in blob:
                 return fn
         raise BinaryError(
-            "store context-window gate not found in " + (", ".join(tried) or "any known symbol")
+            "whitelist gate not found in " + (", ".join(short_symbol(t) for t in tried) or "any known symbol")
         )
 
     def _empty_return_target(self, fn: GoFunc, blob: bytes) -> Optional[int]:
@@ -811,7 +819,7 @@ class Unlocker:
             elif tail[:2] == bytes.fromhex("c9 c3"):
                 hits.append((i, mov_len + 5 + 2))
         if len(hits) > 1:
-            raise BinaryError(f"settings-window: multiple patched sites found in {fn.name}")
+            raise BinaryError(f"settings-window: multiple patched sites found in {short_symbol(fn.name)}")
         return hits[0] if hits else None
 
     def _inspect_settings_window(self, fn: GoFunc, start: int, blob: bytes) -> Tuple[str, int, int, bytes]:
@@ -825,14 +833,12 @@ class Unlocker:
             for i in match_pattern(blob, layout.pattern):
                 matches.append((layout, i))
         if not matches:
-            known = ", ".join(lay.label for lay in SETTINGS_WINDOW_LAYOUTS)
             raise BinaryError(
-                f"settings-window: fallback branch not found in {fn.name} "
-                f"(known layouts: {known})"
+                f"settings-window: expected bytes not found in {short_symbol(fn.name)}"
             )
         if len(matches) > 1:
             where = ", ".join(f"{lay.label}+0x{i:x}" for lay, i in matches)
-            raise BinaryError(f"settings-window: ambiguous fallback branch in {fn.name}: {where}")
+            raise BinaryError(f"settings-window: ambiguous fallback branch in {short_symbol(fn.name)}: {where}")
         layout, i = matches[0]
 
         choice_fn = self.symbols.find("store.(*Store).ContextWindowChoice")
@@ -840,7 +846,7 @@ class Unlocker:
         mov = bytearray(blob[i:i + layout.mov_len])
         mov[2] &= 0xC7  # clear the ModRM.reg field -> %rax (first return register)
         if mov[3] != 0x24:
-            raise BinaryError(f"settings-window: unexpected addressing mode in {fn.name} ({bytes(mov).hex()})")
+            raise BinaryError(f"settings-window: unexpected addressing mode in {short_symbol(fn.name)} ({bytes(mov).hex()})")
         rel = choice_fn.va - (site_va + layout.mov_len + 5)
         if not (-1 << 31 <= rel < 1 << 31):
             raise BinaryError(f"settings-window: ContextWindowChoice out of rel32 range ({rel:#x})")
@@ -856,14 +862,14 @@ class Unlocker:
                 f"settings-window: replacement would clobber the shared return block in {fn.name}"
             )
         if i + len(new_bytes) > len(blob):
-            raise BinaryError(f"settings-window: replacement exceeds function bounds in {fn.name}")
+            raise BinaryError(f"settings-window: replacement exceeds function bounds in {short_symbol(fn.name)}")
         return "clean", start + i, site_va, new_bytes
 
     # -- helpers -----------------------------------------------------------
     def func_bytes(self, fn: GoFunc) -> Tuple[int, int]:
         start = self.elf.va_to_off(fn.va)
         if start is None:
-            raise BinaryError(f"cannot map {fn.name} to a file offset")
+            raise BinaryError(f"cannot map {short_symbol(fn.name)} to a file offset")
         end = self.elf.va_to_off(fn.end)
         if end is None or end <= start:
             end = min(len(self.data), start + 0x4000)
@@ -958,8 +964,9 @@ class Unlocker:
         state, off, site_va, new_bytes = self.inspect_patch(p)
         if state == "patched":
             return PatchResult(p, "already", site_va, off, "already patched")
+        changed = sum(1 for i, b in enumerate(new_bytes) if self.data[off + i] != b)
         self.data[off:off + len(new_bytes)] = new_bytes
-        return PatchResult(p, "applied", site_va, off, p.description)
+        return PatchResult(p, "applied", site_va, off, p.description, changed)
 
 
 # ---------------------------------------------------------------------------
@@ -969,7 +976,8 @@ class Unlocker:
 
 def _header(path: Path, u: Unlocker) -> None:
     print(f"[i] binary : {path}")
-    print(f"[i] sha256 : {u.sha256}")
+    build = f" (agy {u.build_version}, verified)" if u.is_target else ""
+    print(f"[i] sha256 : {u.sha256}{build}")
     print(f"[i] arch   : x86-64 ELF64 (e_type={u.elf.e_type})")
     print(f"[i] text   : va={u.elf.section('.text').addr:#x} "
           f"off={u.elf.section('.text').offset:#x} size={u.elf.section('.text').size:#x}")
@@ -983,8 +991,11 @@ def cmd_locate(args: argparse.Namespace) -> int:
     u = Unlocker(path)
     _header(path, u)
     if not u.is_target:
-        print(f"[!] warning: SHA256 is not the verified {TARGET_VERSION} build "
-              f"({TARGET_SHA256_PREFIX}...); patch signatures may not match")
+        if u.is_patched():
+            print("[i] build  : modified (patched by this tool)")
+        else:
+            print(f"[!] warning: SHA256 is not the verified {TARGET_VERSION} build "
+                  f"({TARGET_SHA256_PREFIX}...); patch signatures may not match")
     print("\n[patch targets]")
     for p in PATCHES:
         try:
@@ -1047,19 +1058,23 @@ def cmd_patch(args: argparse.Namespace) -> int:
         try:
             r = u.apply(p)
         except BinaryError as exc:
-            print(f"  [!] {p.key}: {exc}", file=sys.stderr)
+            print(f"  [!] {p.key}: {patch_error_text(p, exc)}", file=sys.stderr)
             if p.optional:
                 continue
+            print(f"[-] patch failed {src}; binary not modified", file=sys.stderr)
             return 3
         results.append(r)
         print(f"  {'[*]' if r.status == 'applied' else '[=]'} {p.key:16s} {r.detail}")
 
-    changed = any(r.status == "applied" for r in results)
+    applied = [r for r in results if r.status == "applied"]
+    written_bytes = sum(r.changed_bytes for r in applied)
+
+    changed = bool(applied)
     if not changed:
-        print("\n[=] nothing to change (binary already patched)")
+        print(f"\n[=] unchanged {src} ({len(selected)} already present, nothing written)")
         return 0
     if args.dry_run:
-        print("\n[*] dry run: no file written")
+        print(f"\n[+] dry run ok {src} ({len(applied)} would be applied, {written_bytes} bytes); no file written")
         return 0
 
     if args.in_place:
@@ -1083,8 +1098,8 @@ def cmd_patch(args: argparse.Namespace) -> int:
         else:
             _ensure_backup(src, u.sha256)
     _atomic_write(dst, bytes(u.data), src.stat().st_mode)
-    print(f"[*] wrote {dst}")
-    print(f"    sha256 {u.sha256} -> {hashlib.sha256(u.data).hexdigest()}")
+    print(f"[i] sha256 : {u.sha256} -> {hashlib.sha256(u.data).hexdigest()}")
+    print(f"[+] patched {dst} ({len(applied)} applied, {written_bytes} bytes)")
     return 0
 
 
@@ -1185,7 +1200,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
     u = Unlocker(path)
     print(f"[i] {path}\n[i] sha256 {u.sha256}")
     print(f"[i] go text_base={u.symbols.text_base:#x} nfunc={u.symbols.nfunc}")
-    ok = True
+    required = [p for p in PATCHES if not p.optional]
+    patched = 0
     for p in PATCHES:
         try:
             state_key, _off, _va, _new = u.inspect_patch(p)
@@ -1195,10 +1211,16 @@ def cmd_verify(args: argparse.Namespace) -> int:
             applied = False
             status = "UNKNOWN"
         print(f"  {p.key:16s} {status:8s} {u.patch_symbol(p)}")
-        if not p.optional and not applied:
-            ok = False
-    print("[+] verified: required patches are present" if ok else "[-] verification failed")
-    return 0 if ok else 1
+        if applied and not p.optional:
+            patched += 1
+    if patched == len(required):
+        print(f"[+] verified: {patched}/{len(required)} patched")
+        return 0
+    if patched == 0:
+        print(f"[=] not patched: 0/{len(required)} present (run patch)")
+    else:
+        print(f"[!] partial: {patched}/{len(required)} patched (restore, then re-patch)")
+    return 1
 
 
 def cmd_restore(args: argparse.Namespace) -> int:

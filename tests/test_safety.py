@@ -19,10 +19,25 @@ sys.path.insert(0, str(ROOT))
 import agy_context_unlock as unlock  # noqa: E402
 import verify_live as verify  # noqa: E402
 
-BIN = Path("/usr/bin/agy")
-BACKUP_BIN = Path("/usr/bin/agy.agy-unlock-backup")
-HAS_TARGET = BIN.exists() and unlock.identify_build(hashlib.sha256(BIN.read_bytes()).hexdigest()) is not None
-CLEAN_ANY_BIN = BACKUP_BIN if BACKUP_BIN.exists() else (BIN if BIN.exists() else None)
+def _pick_clean_target():
+    """First unpatched binary that matches a known build (prefers /usr/bin/agy)."""
+    candidates = [Path("/usr/bin/agy")]
+    candidates += sorted(Path("/usr/bin").glob("agy.agy-unlock-backup*"))
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        except OSError:
+            continue
+        if unlock.identify_build(sha):
+            return candidate
+    return None
+
+
+CLEAN_ANY_BIN = _pick_clean_target()
+BIN = CLEAN_ANY_BIN or Path("/usr/bin/agy")
+HAS_TARGET = CLEAN_ANY_BIN is not None
 
 
 class TestCompactionSummary(unittest.TestCase):
@@ -146,6 +161,83 @@ class TestPatcherSafety(unittest.TestCase):
             )
             self.assertEqual(r.returncode, 2)
             self.assertIn("--window", r.stderr)
+
+
+@unittest.skipUnless(CLEAN_ANY_BIN is not None, "no clean agy build present")
+class TestOutputVerdicts(unittest.TestCase):
+    """Every command must end with a one-line verdict the user can act on."""
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(ROOT / "agy_context_unlock.py"), *args],
+            capture_output=True, text=True, timeout=180,
+        )
+
+    @staticmethod
+    def _last(stream: str) -> str:
+        return stream.strip().splitlines()[-1] if stream.strip() else ""
+
+    def _copy(self, td: str) -> Path:
+        dst = Path(td) / "agy"
+        shutil.copy2(CLEAN_ANY_BIN, dst)
+        return dst
+
+    def test_verify_clean_ends_with_not_patched(self):
+        r = self._run("verify", "--binary", str(CLEAN_ANY_BIN))
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self._last(r.stdout), "[=] not patched: 0/5 present (run patch)")
+
+    def test_dry_run_ends_with_verdict(self):
+        r = self._run("patch", "--binary", str(CLEAN_ANY_BIN), "--dry-run")
+        self.assertEqual(r.returncode, 0)
+        last = self._last(r.stdout)
+        self.assertTrue(last.startswith("[+] dry run ok "), last)
+        self.assertIn("no file written", last)
+
+    def test_patch_noop_and_verify_verdicts(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = self._copy(td)
+            r1 = self._run("patch", "--binary", str(target), "--in-place", "--yes")
+            self.assertEqual(r1.returncode, 0, r1.stderr)
+            first = self._last(r1.stdout)
+            self.assertTrue(first.startswith(f"[+] patched {target} "), first)
+            self.assertIn("(5 applied, 42 bytes)", first)
+
+            r2 = self._run("verify", "--binary", str(target))
+            self.assertEqual(r2.returncode, 0)
+            self.assertEqual(self._last(r2.stdout), "[+] verified: 5/5 patched")
+
+            r3 = self._run("patch", "--binary", str(target), "--in-place", "--yes")
+            self.assertEqual(r3.returncode, 0)
+            self.assertEqual(self._last(r3.stdout), f"[=] unchanged {target} (5 already present, nothing written)")
+
+    def test_partial_state_reports_partial(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = self._copy(td)
+            r1 = self._run("patch", "--binary", str(target), "--in-place", "--yes", "--patches", "ui-selector")
+            self.assertEqual(r1.returncode, 0, r1.stderr)
+            r2 = self._run("verify", "--binary", str(target))
+            self.assertEqual(r2.returncode, 1)
+            self.assertEqual(self._last(r2.stdout), "[!] partial: 1/5 patched (restore, then re-patch)")
+
+    def test_failure_ends_with_zero_write_guarantee(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = self._copy(td)
+            before = hashlib.sha256(target.read_bytes()).hexdigest()
+            # Corrupt the settings-window signature so the patch aborts in memory.
+            u = unlock.Unlocker(target)
+            patch = next(p for p in unlock.PATCHES if p.key == "settings-window")
+            _state, off, _va, _new = u.inspect_patch(patch)
+            raw = bytearray(target.read_bytes())
+            raw[off] ^= 0xFF
+            target.write_bytes(raw)
+
+            r = self._run("patch", "--binary", str(target), "--in-place", "--yes", "--allow-unknown")
+            self.assertEqual(r.returncode, 3)
+            self.assertEqual(self._last(r.stderr), f"[-] patch failed {target}; binary not modified")
+            self.assertIn("expected bytes not found", r.stderr)
+            self.assertNotIn("settings-window: settings-window:", r.stderr)
+            self.assertNotEqual(hashlib.sha256(target.read_bytes()).hexdigest(), before)
 
 
 @unittest.skipUnless(CLEAN_ANY_BIN is not None, "no local agy binary present")
